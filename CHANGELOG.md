@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- Transactions are fetched before the Amazon order-data prompt, and the tool exits immediately when there is nothing to process — no more pasting order data against zero transactions
+
 ## [2.4.2] - 2026-07-10
 
 ### Added

@@ -891,7 +891,36 @@ def _run(argv: list[str] | None = None) -> int:
     ynab_client = YNABClient(config.api_key, config.budget_id)
     memo_generator = MemoGenerator(config.amazon_domain)
 
-    print("Fetching categories...")
+    # Fetch transactions FIRST so the user isn't asked to paste Amazon order
+    # data (or wait on a category fetch) when there is nothing to match it to.
+    print("\nFetching transactions...")
+    try:
+        transactions_to_process = fetch_amazon_transactions(
+            ynab_client, config, include_reconciled=include_reconciled
+        )
+    except (
+        YNABAPIError,
+        requests.exceptions.RequestException,
+        OSError,
+    ) as exc:
+        logger.error("Failed to fetch transactions: %s", exc)
+        print(f"Could not fetch transactions: {exc}")
+        return 1
+
+    if not transactions_to_process:
+        print("\nNo uncategorized Amazon transactions found — nothing to do. ✓")
+        return 0
+
+    reconciled_count = sum(
+        1 for t in transactions_to_process if t.get("cleared") == "reconciled"
+    )
+    print(
+        f"\nFound {len(transactions_to_process)} uncategorized Amazon transaction(s) needing attention."
+    )
+    if reconciled_count:
+        print(f"  ({reconciled_count} of these are already reconciled 🔒)")
+
+    print("\nFetching categories...")
     try:
         categories_list, category_name_map, category_id_map = (
             ynab_client.get_categories()
@@ -938,29 +967,6 @@ def _run(argv: list[str] | None = None) -> int:
                 print(f"  ... and {len(parsed_orders) - 3} more orders")
         else:
             print("No valid orders found in provided data.")
-
-    print("\nFetching transactions...")
-    try:
-        transactions_to_process = fetch_amazon_transactions(
-            ynab_client, config, include_reconciled=include_reconciled
-        )
-    except (
-        YNABAPIError,
-        requests.exceptions.RequestException,
-        OSError,
-    ) as exc:
-        logger.error("Failed to fetch transactions: %s", exc)
-        print(f"Could not fetch transactions: {exc}")
-        return 1
-
-    reconciled_count = sum(
-        1 for t in transactions_to_process if t.get("cleared") == "reconciled"
-    )
-    print(
-        f"\nFound {len(transactions_to_process)} uncategorized Amazon transaction(s) needing attention."
-    )
-    if reconciled_count:
-        print(f"  ({reconciled_count} of these are already reconciled 🔒)")
 
     # --- Batch Mode (non-interactive memo enrichment) ---
     if args.batch:

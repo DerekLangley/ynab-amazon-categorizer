@@ -1412,6 +1412,38 @@ def test_main_batch_dry_run_smoke(
     assert "Batch complete: 1 enriched" in capsys.readouterr().out
 
 
+def test_main_exits_before_order_prompt_when_no_transactions(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With zero uncategorized Amazon transactions, the run ends right after
+    the transaction fetch — before fetching categories and, most importantly,
+    before asking the user to paste Amazon order data there is nothing to
+    match against."""
+    config = Config("secret", "budget")
+    client = Mock()
+    client.get_categories.side_effect = AssertionError(
+        "categories must not be fetched when there are no transactions"
+    )
+
+    monkeypatch.setattr(Config, "from_env", classmethod(lambda cls: config))
+    monkeypatch.setattr(cli_module, "YNABClient", lambda *_args: client)
+    monkeypatch.setattr(
+        cli_module,
+        "_prompt_line",
+        Mock(side_effect=AssertionError("no prompt should fire without transactions")),
+    )
+    monkeypatch.setattr(
+        cli_module, "fetch_amazon_transactions", lambda *_args, **_kwargs: []
+    )
+
+    exit_code = cli_module.main([])
+
+    assert exit_code == 0
+    captured = capsys.readouterr().out
+    assert "nothing to do" in captured
+    assert "Amazon Orders Data" not in captured
+
+
 @pytest.mark.parametrize("interrupt", [KeyboardInterrupt(), EOFError()])
 def test_main_handles_terminal_interruption(
     monkeypatch: pytest.MonkeyPatch,
@@ -1429,6 +1461,13 @@ def test_main_handles_terminal_interruption(
 
     monkeypatch.setattr(Config, "from_env", classmethod(lambda cls: config))
     monkeypatch.setattr(cli_module, "YNABClient", lambda *_args: client)
+    # Transactions are fetched before the first prompt now; one must exist
+    # for the run to reach the interactive prompts at all.
+    monkeypatch.setattr(
+        cli_module,
+        "fetch_amazon_transactions",
+        lambda *_args, **_kwargs: [_batch_txn("t1", -20000)],
+    )
 
     def interrupt_prompt(_message: str) -> str:
         raise interrupt
