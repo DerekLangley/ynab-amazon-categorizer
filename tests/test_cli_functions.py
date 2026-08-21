@@ -1508,6 +1508,11 @@ def test_main_handles_terminal_interruption(
         raise interrupt
 
     monkeypatch.setattr(cli_module, "_prompt_line", interrupt_prompt)
+    # The paste box is the first prompt now; submit empty so the run reaches
+    # the per-transaction prompts this test interrupts.
+    monkeypatch.setattr(
+        cli_module, "get_multiline_input_with_custom_submit", lambda _prompt: ""
+    )
 
     exit_code = cli_module.main([])
 

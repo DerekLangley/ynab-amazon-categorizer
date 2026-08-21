@@ -39,6 +39,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   supply it — the payments page for unmatched transactions, and each order's
   details page for orders with no items
 
+### Changed
+
+- The "Would you like to provide Amazon data?" prompt is gone: submitting an
+  empty paste already means "no data", so it gated a step that could already be
+  skipped
+- Data-entry instructions are three lines instead of eleven
+
 ### Fixed
 
 - Page links use the configured `AMAZON_DOMAIN` instead of a hardcoded

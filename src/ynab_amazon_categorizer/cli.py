@@ -63,17 +63,18 @@ def _print_amazon_data_instructions(domain: str) -> None:
     pointing at a domain the user does not shop on.
     """
     print("\n--- Amazon Data Entry ---")
-    print("Paste any of these pages; the tool works out which is which.")
-    print("  1. Your Orders          - order totals and item names")
-    print(f"     {orders_page_url(domain)}")
-    print("  2. Order details        - every item with its price, plus tax")
-    print("     (open an order and choose 'View order details')")
-    print("  3. Your Transactions    - which card charge paid for which order")
-    print(f"     {transactions_page_url(domain)}")
+    print("You may paste in any or all of:")
     print(
-        "\nPage 3 is what resolves transactions the orders page alone cannot: an\n"
-        "order billed once per shipment, one split with a gift card or points,\n"
-        "or a refund. Page 2 fills in items the orders page truncates."
+        "  1. Your Orders - contains order totals and item names - "
+        f"{orders_page_url(domain)}"
+    )
+    print(
+        "  2. Your Transactions - shows which card charge paid for which order - "
+        f"{transactions_page_url(domain)}"
+    )
+    print(
+        "  3. Order details - has full item details. "
+        "You'll be prompted for this if needed."
     )
 
 
@@ -1209,23 +1210,9 @@ def _run(argv: list[str] | None = None) -> int:
     category_completer_instance = CategoryCompleter(categories_list)
     print(f"\nFound {len(categories_list)} usable categories. Completion enabled.")
 
-    # Ask user if they want to provide Amazon page data for automatic item detection
-    print("\n--- Optional: Amazon Data ---")
-    print(
-        "You can paste your Amazon orders, order details, and transactions pages\n"
-        "to match YNAB transactions to orders and their items."
-    )
-    provide_orders = _prompt_line(
-        "Would you like to provide Amazon data? (y/n, default y): "
-    ).lower()
-    if not provide_orders:
-        provide_orders = "y"
-
-    amazon_data: AmazonData | None = None
-    if provide_orders == "y":
-        amazon_data = prompt_for_amazon_data(transactions_to_process, memo_generator)
-        if not amazon_data:
-            print("No usable Amazon data found in provided text.")
+    # No opt-out prompt: submitting an empty paste already means "no data", and
+    # an empty AmazonData takes the same path as none at all.
+    amazon_data = prompt_for_amazon_data(transactions_to_process, memo_generator)
 
     # --- Batch Mode (non-interactive memo enrichment) ---
     if args.batch:
