@@ -1208,19 +1208,27 @@ def test_env_flag_recognizes_common_truthy_values(
     assert _env_flag("_TEST_FLAG", default=True) is True
 
 
-def test_skip_split_prompt_single_item_env_var(
+def _single_item_order() -> Order:
+    return Order(
+        order_id="114-8901234-8901234",
+        total=15.00,
+        date_str="January 15, 2025",
+        items=["The Only Item In This Order"],
+        currency="$",
+    )
+
+
+def test_single_item_split_prompt_is_skipped_by_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """With YNAB_SKIP_SPLIT_PROMPT_SINGLE_ITEM set and nothing to split
-    (matching_order is None here), the 'Split this transaction?' prompt is
-    skipped entirely — only one _prompt_line response is needed, not two."""
+    """One item means nothing to divide, so the prompt is off by default."""
     transaction = {
         "id": "t1",
         "account_id": "a1",
         "date": "2025-01-15",
         "amount": -15000,
     }
-    monkeypatch.setenv("YNAB_SKIP_SPLIT_PROMPT_SINGLE_ITEM", "true")
+    monkeypatch.delenv("YNAB_SKIP_SPLIT_PROMPT_SINGLE_ITEM", raising=False)
     monkeypatch.setattr(
         "ynab_amazon_categorizer.cli.prompt_for_category_selection",
         lambda *a, **k: ("cat1", "Cat One"),
@@ -1229,17 +1237,98 @@ def test_skip_split_prompt_single_item_env_var(
         "ynab_amazon_categorizer.cli.get_multiline_input_with_custom_submit",
         lambda *a, **k: "",
     )
-    # Only "Enter item details manually?" -> n; no split-decision response.
-    responses = iter(["n"])
+    asked: list[str] = []
     monkeypatch.setattr(
-        "ynab_amazon_categorizer.cli._prompt_line", lambda _prompt: next(responses)
+        "ynab_amazon_categorizer.cli._prompt_line",
+        lambda message: (asked.append(message), "y")[1],
     )
 
     result = _handle_categorize(
-        transaction, None, "", MemoGenerator(), Mock(), Mock(), {}, {}, dry_run=True
+        transaction,
+        _single_item_order(),
+        "",
+        MemoGenerator(),
+        Mock(),
+        Mock(),
+        {},
+        {},
+        dry_run=True,
     )
 
     assert result == "done"
+    assert not any("Split this transaction?" in message for message in asked)
+
+
+def test_single_item_split_prompt_can_be_switched_back_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The old behaviour stays available for anyone who wants it."""
+    transaction = {
+        "id": "t1",
+        "account_id": "a1",
+        "date": "2025-01-15",
+        "amount": -15000,
+    }
+    monkeypatch.setenv("YNAB_SKIP_SPLIT_PROMPT_SINGLE_ITEM", "false")
+    monkeypatch.setattr(
+        "ynab_amazon_categorizer.cli.prompt_for_category_selection",
+        lambda *a, **k: ("cat1", "Cat One"),
+    )
+    monkeypatch.setattr(
+        "ynab_amazon_categorizer.cli.get_multiline_input_with_custom_submit",
+        lambda *a, **k: "",
+    )
+    asked: list[str] = []
+    monkeypatch.setattr(
+        "ynab_amazon_categorizer.cli._prompt_line",
+        lambda message: (asked.append(message), "n")[1],
+    )
+
+    _handle_categorize(
+        transaction,
+        _single_item_order(),
+        "",
+        MemoGenerator(),
+        Mock(),
+        Mock(),
+        {},
+        {},
+        dry_run=True,
+    )
+
+    assert any("Split this transaction?" in message for message in asked)
+
+
+def test_split_prompt_still_asked_without_item_data(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No item data is not the same as one item — a manual split may be wanted."""
+    transaction = {
+        "id": "t1",
+        "account_id": "a1",
+        "date": "2025-01-15",
+        "amount": -15000,
+    }
+    monkeypatch.delenv("YNAB_SKIP_SPLIT_PROMPT_SINGLE_ITEM", raising=False)
+    monkeypatch.setattr(
+        "ynab_amazon_categorizer.cli.prompt_for_category_selection",
+        lambda *a, **k: ("cat1", "Cat One"),
+    )
+    monkeypatch.setattr(
+        "ynab_amazon_categorizer.cli.get_multiline_input_with_custom_submit",
+        lambda *a, **k: "",
+    )
+    asked: list[str] = []
+    monkeypatch.setattr(
+        "ynab_amazon_categorizer.cli._prompt_line",
+        lambda message: (asked.append(message), "n")[1],
+    )
+
+    _handle_categorize(
+        transaction, None, "", MemoGenerator(), Mock(), Mock(), {}, {}, dry_run=True
+    )
+
+    assert any("Split this transaction?" in message for message in asked)
 
 
 def test_split_prompt_still_asked_without_env_var(

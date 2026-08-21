@@ -1073,20 +1073,26 @@ def _handle_categorize(
     transaction_id = transaction["id"]
     updated_payload_dict: TransactionUpdate | None = None
 
-    # Check if we should offer splitting
-    should_offer_split = bool(
-        matching_order and matching_order.items and len(matching_order.items) > 1
-    )
+    # Splitting is offered whenever it might plausibly be wanted. The one
+    # exception is a transaction we know holds exactly one item: splitting it
+    # across categories is possible but rare, so it is not asked by default.
+    # Set YNAB_SKIP_SPLIT_PROMPT_SINGLE_ITEM=false to be asked anyway.
+    #
+    # A transaction with *no* item data is deliberately not covered by that:
+    # we know nothing about it, so the user may well want to split it by hand
+    # and there is no basis for assuming otherwise.
+    item_count = len(matching_order.items) if matching_order else 0
+    should_offer_split = item_count > 1
+    known_single_item = item_count == 1
 
     if should_offer_split:
         print("There is more than one item in this transaction.")
-    elif _env_flag("YNAB_SKIP_SPLIT_PROMPT_SINGLE_ITEM"):
-        # Only one item (or no matched order). A split across categories is
-        # still possible, so this is not asked-for-nothing, but the user has
-        # opted via .env to skip being asked every time.
-        split_decision = "n"
 
-    if should_offer_split or not _env_flag("YNAB_SKIP_SPLIT_PROMPT_SINGLE_ITEM"):
+    if known_single_item and _env_flag(
+        "YNAB_SKIP_SPLIT_PROMPT_SINGLE_ITEM", default=True
+    ):
+        split_decision = "n"
+    else:
         split_decision = _prompt_line(
             "Split this transaction? (y/n, default n): "
         ).lower()
@@ -1208,8 +1214,6 @@ def _run(argv: list[str] | None = None) -> int:
         print("*** DRY RUN: no changes will be sent to YNAB. ***")
     if include_reconciled:
         print("*** Including already-reconciled transactions. ***")
-    if _env_flag("YNAB_SKIP_SPLIT_PROMPT_SINGLE_ITEM"):
-        print("*** Skipping split prompt for single-item transactions. ***")
 
     # Load configuration using extracted Config class
     try:

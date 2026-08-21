@@ -56,6 +56,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   decision to process the transaction at all
 - An inflow that matched nothing is skipped without being asked about, since
   processing it could not have done anything
+- A transaction known to hold a single item is no longer asked about splitting;
+  `YNAB_SKIP_SPLIT_PROMPT_SINGLE_ITEM=false` restores the prompt. A transaction
+  with no item data is still asked, since a manual split may well be wanted
+- Removed the startup banner for that flag, which would now announce default
+  behaviour on every run
 
 ### Fixed
 

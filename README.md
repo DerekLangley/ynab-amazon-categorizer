@@ -194,6 +194,13 @@ including both transactions of a two-shipment order.
      page as the base amount
    - Confirm updates with enhanced previews
 
+### Optional settings
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `AMAZON_DOMAIN` | `amazon.ca` | Storefront used for every Amazon link |
+| `YNAB_SKIP_SPLIT_PROMPT_SINGLE_ITEM` | `true` | Skip "Split this transaction?" when the order holds one item. Set to `false` to always be asked. Transactions with no item data are asked either way. |
+
 ### Keyboard Shortcuts
 - **Tab**: Auto-complete category names
 - **Enter**: Accept defaults (categorize, use suggested memo, confirm update)
