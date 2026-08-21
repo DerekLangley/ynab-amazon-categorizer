@@ -69,7 +69,7 @@ def _print_amazon_data_instructions(domain: str) -> None:
         f"{orders_page_url(domain)}"
     )
     print(
-        "  2. Your Transactions - shows which card charge paid for which order - "
+        "  2. Your Transactions - maps card charges to orders - "
         f"{transactions_page_url(domain)}"
     )
     print(
