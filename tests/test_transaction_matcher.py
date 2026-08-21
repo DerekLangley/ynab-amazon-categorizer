@@ -6,7 +6,7 @@ import pytest
 
 from ynab_amazon_categorizer.amazon_data import AmazonData
 from ynab_amazon_categorizer.amazon_parser import Order
-from ynab_amazon_categorizer.models import AmazonCharge
+from ynab_amazon_categorizer.models import AmazonCharge, OrderItem
 from ynab_amazon_categorizer.transaction_matcher import (
     TransactionMatcher,
     mark_match_used,
@@ -591,3 +591,27 @@ def test_mark_match_used_is_the_shared_consumption_policy() -> None:
 
     mark_match_used(order, used_orders, used_charges)
     assert used_orders == {"114-1234567-1234567"}
+
+
+def test_summarize_coverage_counts_covered_orders_without_prices() -> None:
+    """Complete coverage is not the same as complete pricing."""
+    order = _make_order(
+        order_id="114-8901234-8901234", total=42.68, date_str="August 13, 2026"
+    )
+    summary = summarize_coverage([_txn(-42.68)], AmazonData(orders=[order]))
+
+    assert summary.is_complete
+    assert summary.without_prices == 1
+
+
+def test_summarize_coverage_reports_no_missing_prices_for_priced_orders() -> None:
+    order = _make_order(
+        order_id="114-8901234-8901234", total=42.68, date_str="August 13, 2026"
+    )
+    order.detailed_items = [OrderItem("Widget A", 42.68)]
+    order.item_prices = [42.68]
+
+    summary = summarize_coverage([_txn(-42.68)], AmazonData(orders=[order]))
+
+    assert summary.is_complete
+    assert summary.without_prices == 0

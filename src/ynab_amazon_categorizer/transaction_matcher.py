@@ -366,6 +366,7 @@ class CoverageSummary:
     total: int = 0
     described: int = 0
     without_items: int = 0
+    without_prices: int = 0
     unmatched: int = 0
     orders_needing_details: list[str] = field(default_factory=list)
 
@@ -376,7 +377,12 @@ class CoverageSummary:
 
     @property
     def is_complete(self) -> bool:
-        """True when every transaction has an order *and* its items."""
+        """True when every transaction has an order *and* its items.
+
+        Note this does not imply every item has a *price*: an order matched
+        from the orders list page has names only. ``without_prices`` counts
+        those, since their details pages would still improve splitting.
+        """
         return self.total > 0 and self.described == self.total
 
 
@@ -413,6 +419,8 @@ def summarize_coverage(
         mark_match_used(order, used_order_ids, used_charge_keys)
         if order.items:
             summary.described += 1
+            if not order.has_item_prices:
+                summary.without_prices += 1
             continue
 
         summary.without_items += 1

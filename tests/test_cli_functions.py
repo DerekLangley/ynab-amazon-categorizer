@@ -1949,6 +1949,7 @@ ORDER # 114-8901234-8901234
         "get_multiline_input_with_custom_submit",
         lambda _prompt: pages.pop(0),
     )
+    monkeypatch.setattr(cli_module, "_prompt_line", lambda _message: "")
 
     cli_module.prompt_for_amazon_data(
         [_charge_txn("t1", -115220)], MemoGenerator("amazon.com")
@@ -1973,3 +1974,90 @@ def test_prompt_for_amazon_data_stays_quiet_without_transactions(
     cli_module.prompt_for_amazon_data()
 
     assert "Coverage:" not in capsys.readouterr().out
+
+
+def test_prompt_for_amazon_data_stops_asking_once_covered(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Full coverage must end the loop instead of presenting another paste box."""
+    orders_page = """
+ORDER PLACED
+August 13, 2026
+TOTAL
+$115.22
+ORDER # 114-8901234-8901234
+ Amazon Basics Low-Odor Dry Erase Whiteboard Markers, 4-Pack
+"""
+    pages = [orders_page]  # a second read would raise IndexError
+    asked: list[str] = []
+    monkeypatch.setattr(
+        cli_module,
+        "get_multiline_input_with_custom_submit",
+        lambda _prompt: pages.pop(0),
+    )
+    monkeypatch.setattr(
+        cli_module, "_prompt_line", lambda message: (asked.append(message), "")[1]
+    )
+
+    cli_module.prompt_for_amazon_data(
+        [_charge_txn("t1", -115220)], MemoGenerator("amazon.com")
+    )
+
+    assert any("Paste more pages anyway?" in message for message in asked)
+    assert "Paste page 2" not in capsys.readouterr().out
+
+
+def test_prompt_for_amazon_data_keeps_going_when_asked(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Answering yes reopens the paste box for optional extra pages."""
+    orders_page = """
+ORDER PLACED
+August 13, 2026
+TOTAL
+$115.22
+ORDER # 114-8901234-8901234
+ Amazon Basics Low-Odor Dry Erase Whiteboard Markers, 4-Pack
+"""
+    pages = [orders_page, ""]
+    monkeypatch.setattr(
+        cli_module,
+        "get_multiline_input_with_custom_submit",
+        lambda _prompt: pages.pop(0),
+    )
+    monkeypatch.setattr(cli_module, "_prompt_line", lambda _message: "y")
+
+    cli_module.prompt_for_amazon_data(
+        [_charge_txn("t1", -115220)], MemoGenerator("amazon.com")
+    )
+
+    assert "Paste page 2" in capsys.readouterr().out
+
+
+def test_prompt_for_amazon_data_flags_missing_item_prices(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Covered-but-unpriced is called out, since it still affects splitting."""
+    orders_page = """
+ORDER PLACED
+August 13, 2026
+TOTAL
+$115.22
+ORDER # 114-8901234-8901234
+ Amazon Basics Low-Odor Dry Erase Whiteboard Markers, 4-Pack
+"""
+    pages = [orders_page]
+    monkeypatch.setattr(
+        cli_module,
+        "get_multiline_input_with_custom_submit",
+        lambda _prompt: pages.pop(0),
+    )
+    monkeypatch.setattr(cli_module, "_prompt_line", lambda _message: "")
+
+    cli_module.prompt_for_amazon_data(
+        [_charge_txn("t1", -115220)], MemoGenerator("amazon.com")
+    )
+
+    captured = capsys.readouterr().out
+    assert "have item names but no prices" in captured
+    assert "Nothing further is needed." not in captured

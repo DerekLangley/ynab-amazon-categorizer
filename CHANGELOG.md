@@ -32,6 +32,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   after every page — how many transactions it can fully describe, and a linked
   list of the exact orders whose details pages are still worth fetching — plus
   a hint at which page will close the remaining gap
+- The paste loop ends once every transaction is covered instead of asking for
+  another page, and says when covered orders still lack item prices so extra
+  details pages remain an informed choice
 
 ### Changed
 

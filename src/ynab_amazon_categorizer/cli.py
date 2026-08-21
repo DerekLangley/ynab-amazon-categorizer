@@ -138,10 +138,32 @@ def _print_coverage(summary: CoverageSummary, memo_generator: MemoGenerator) -> 
         print(f"        ... and {remaining} more order(s)")
 
 
+def _confirm_more_pages(summary: CoverageSummary) -> bool:
+    """Ask whether to keep pasting once every transaction is already covered.
+
+    Without this the loop kept presenting a paste box after there was nothing
+    left to collect. Answering is one keystroke, and the default ends the loop,
+    so the common case is just Enter.
+    """
+    print("  ✓ Every transaction has an order and its items.")
+    if summary.without_prices:
+        # Complete coverage is not the same as complete *pricing*: an order
+        # matched from the orders list page has item names but no prices.
+        print(
+            f"  {summary.without_prices} transaction(s) have item names but no "
+            "prices — their\n    order details pages would make splits exact. "
+            "Optional."
+        )
+    else:
+        print("  Nothing further is needed.")
+
+    answer = _prompt_line("Paste more pages anyway? (y/n, default n): ")
+    return answer.strip().lower() == "y"
+
+
 def _print_coverage_advice(summary: CoverageSummary, amazon_data: AmazonData) -> None:
     """Suggest the page most likely to close the remaining gap."""
     if summary.is_complete:
-        print("  ✓ Every transaction has an order and its items.")
         return
     if summary.unmatched and not amazon_data.charges:
         print(
@@ -207,6 +229,8 @@ def prompt_for_amazon_data(
             summary = summarize_coverage(pending, amazon_data)
             _print_coverage(summary, links)
             _print_coverage_advice(summary, amazon_data)
+            if summary.is_complete and not _confirm_more_pages(summary):
+                break
 
     _print_amazon_data_summary(amazon_data)
     if pending and amazon_data:
