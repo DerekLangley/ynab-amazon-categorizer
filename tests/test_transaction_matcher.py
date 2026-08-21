@@ -596,12 +596,31 @@ def test_mark_match_used_is_the_shared_consumption_policy() -> None:
 def test_summarize_coverage_counts_covered_orders_without_prices() -> None:
     """Complete coverage is not the same as complete pricing."""
     order = _make_order(
-        order_id="114-8901234-8901234", total=42.68, date_str="August 13, 2026"
+        order_id="114-8901234-8901234",
+        total=42.68,
+        date_str="August 13, 2026",
+        items=["Widget A", "Widget B"],
     )
     summary = summarize_coverage([_txn(-42.68)], AmazonData(orders=[order]))
 
     assert summary.is_complete
     assert summary.without_prices == 1
+
+
+def test_summarize_coverage_ignores_price_gaps_on_single_item_orders() -> None:
+    """A single-item order cannot be split, so its price changes nothing."""
+    order = _make_order(
+        order_id="114-8901234-8901234",
+        total=42.68,
+        date_str="August 13, 2026",
+        items=["Only Item"],
+    )
+
+    summary = summarize_coverage([_txn(-42.68)], AmazonData(orders=[order]))
+
+    assert summary.is_complete
+    assert summary.without_prices == 0
+    assert summary.orders_needing_prices == []
 
 
 def test_summarize_coverage_reports_no_missing_prices_for_priced_orders() -> None:
@@ -620,7 +639,10 @@ def test_summarize_coverage_reports_no_missing_prices_for_priced_orders() -> Non
 def test_summarize_coverage_names_orders_needing_prices() -> None:
     """Knowing the count is not enough — the user needs the order to go fetch."""
     order = _make_order(
-        order_id="114-8901234-8901234", total=42.68, date_str="August 13, 2026"
+        order_id="114-8901234-8901234",
+        total=42.68,
+        date_str="August 13, 2026",
+        items=["Widget A", "Widget B"],
     )
     summary = summarize_coverage([_txn(-42.68)], AmazonData(orders=[order]))
 

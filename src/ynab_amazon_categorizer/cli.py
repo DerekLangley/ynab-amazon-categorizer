@@ -257,16 +257,22 @@ def prompt_for_amazon_data(
 
 
 def prompt_for_order_details(
-    amazon_data: AmazonData, order_id: str, memo_generator: MemoGenerator
+    amazon_data: AmazonData,
+    order_id: str,
+    memo_generator: MemoGenerator,
+    lead: str | None = None,
 ) -> Order | None:
-    """Offer to take the details page for an order we only know by ID.
+    """Offer to take the details page for an order, on demand.
 
-    Reached when a charge identifies the order behind a transaction but no
-    pasted page described it. Pasting that one page turns "some Amazon order"
-    into a real item list, which is the whole point of categorizing.
+    Used when the pasted pages fall short at the moment it actually matters:
+    a charge names an order nothing described, or a split needs the per-item
+    prices only the details page carries. ``lead`` states which.
     """
     order_link = memo_generator.generate_amazon_order_link(order_id)
-    print(f"  This charge belongs to order {order_id}, but no item data was provided.")
+    print(
+        lead
+        or f"  This charge belongs to order {order_id}, but no item data was provided."
+    )
     if order_link:
         print(f"  Details page: {order_link}")
 
@@ -988,6 +994,7 @@ def process_transaction(
                 category_name_map,
                 category_id_map,
                 dry_run,
+                amazon_data,
             )
             if result == "done":
                 # Mark what was consumed so it is not reused for a later
@@ -1002,6 +1009,40 @@ def process_transaction(
             print("Invalid action. Choose 'c', 's', or 'q'.")
 
 
+def _offer_prices_for_split(
+    matching_order: Order | None,
+    amazon_data: AmazonData | None,
+    memo_generator: MemoGenerator,
+) -> Order | None:
+    """Offer the details page when a split would benefit from item prices.
+
+    An order from the orders list page has item names but no prices, which is
+    fine until the user splits it — only then does the per-item amount matter.
+    Asking here keeps the up-front prompt quiet for the orders where prices
+    would change nothing.
+    """
+    if (
+        amazon_data is None
+        or matching_order is None
+        or not matching_order.order_id
+        or matching_order.has_item_prices
+    ):
+        return matching_order
+
+    improved = prompt_for_order_details(
+        amazon_data,
+        matching_order.order_id,
+        memo_generator,
+        lead=(
+            "  This order has item names but no prices. Its details page would "
+            "let\n  the split use each item's real amount."
+        ),
+    )
+    if improved is None:
+        return matching_order
+    return dataclasses.replace(improved, matched_charge=matching_order.matched_charge)
+
+
 def _handle_categorize(
     transaction: Mapping[str, Any],
     matching_order: Order | None,
@@ -1012,6 +1053,7 @@ def _handle_categorize(
     category_name_map: dict[str, str],
     category_id_map: dict[str, str],
     dry_run: bool = False,
+    amazon_data: AmazonData | None = None,
 ) -> str:
     """Handle the categorize action for a transaction.
 
@@ -1058,6 +1100,11 @@ def _handle_categorize(
         )
     else:
         # --- SPLITTING ---
+        # Only now do per-item prices matter, so this is where it is worth
+        # asking for the details page rather than up front for every order.
+        matching_order = _offer_prices_for_split(
+            matching_order, amazon_data, memo_generator
+        )
         subtransactions = handle_split(
             transaction,
             matching_order,

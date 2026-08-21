@@ -1,5 +1,6 @@
 """Tests for extracted CLI helper functions."""
 
+import dataclasses
 from unittest.mock import Mock
 
 import pytest
@@ -2050,6 +2051,7 @@ TOTAL
 $115.22
 ORDER # 114-8901234-8901234
  Amazon Basics Low-Odor Dry Erase Whiteboard Markers, 4-Pack
+ BIC Brite Liner Highlighters, Chisel Tip, 12-Count Pack, Assorted Colors
 """
     pages = [orders_page]
     monkeypatch.setattr(
@@ -2152,6 +2154,7 @@ TOTAL
 $115.22
 ORDER # 114-8901234-8901234
  Amazon Basics Low-Odor Dry Erase Whiteboard Markers, 4-Pack
+ BIC Brite Liner Highlighters, Chisel Tip, 12-Count Pack, Assorted Colors
 """
     pages = [orders_page]
     monkeypatch.setattr(
@@ -2171,3 +2174,122 @@ ORDER # 114-8901234-8901234
         "https://www.amazon.ca/gp/your-account/order-details"
         "?ie=UTF8&orderID=114-8901234-8901234" in captured
     )
+
+
+# --- prices offered at the split, not up front -------------------------------
+
+
+def _unpriced_multi_item_order() -> Order:
+    """What the orders list page yields: item names, no prices."""
+    return Order(
+        order_id="114-8901234-8901234",
+        total=20.59,
+        date_str="August 13, 2026",
+        items=["Widget A", "Widget B"],
+        currency="$",
+    )
+
+
+def test_offer_prices_for_split_asks_only_when_prices_are_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asked: list[str] = []
+    monkeypatch.setattr(
+        cli_module,
+        "_prompt_line",
+        lambda message: (asked.append(message), "n")[1],
+    )
+
+    order = _unpriced_multi_item_order()
+    cli_module._offer_prices_for_split(order, AmazonData(), MemoGenerator())
+
+    assert asked, "an unpriced order should prompt for its details page"
+
+
+def test_offer_prices_for_split_stays_quiet_when_prices_are_known(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nothing to gain, so nothing to ask."""
+
+    def fail(_message: str) -> str:
+        raise AssertionError("must not prompt when item prices are known")
+
+    monkeypatch.setattr(cli_module, "_prompt_line", fail)
+    priced = _shipment_data().orders[0]
+
+    assert (
+        cli_module._offer_prices_for_split(priced, AmazonData(), MemoGenerator())
+        is priced
+    )
+
+
+def test_offer_prices_for_split_keeps_the_matched_charge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fetched details must not drop which charge this transaction is."""
+    details = """
+Order placed August 13, 2026  Order # 114-8901234-8901234
+Order Summary
+Grand Total:
+$20.59
+A Perfectly Ordinary Product Name Here
+A Perfectly Ordinary Product Name Here
+Sold by: Amazon.com
+$18.99
+"""
+    monkeypatch.setattr(cli_module, "_prompt_line", lambda _message: "y")
+    monkeypatch.setattr(
+        cli_module, "get_multiline_input_with_custom_submit", lambda _prompt: details
+    )
+    charge = AmazonCharge(
+        amount=-4.98, order_id="114-8901234-8901234", date_str="August 9, 2026"
+    )
+    order = dataclasses.replace(_unpriced_multi_item_order(), matched_charge=charge)
+    data = AmazonData()
+
+    improved = cli_module._offer_prices_for_split(order, data, MemoGenerator())
+
+    assert improved is not None
+    assert improved.has_item_prices
+    assert improved.matched_charge is charge
+
+
+def test_offer_prices_for_split_survives_a_decline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli_module, "_prompt_line", lambda _message: "n")
+    order = _unpriced_multi_item_order()
+
+    assert (
+        cli_module._offer_prices_for_split(order, AmazonData(), MemoGenerator())
+        is order
+    )
+
+
+def test_single_item_order_never_prompts_for_prices_up_front(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The reported case: one item, so a price would change nothing."""
+    orders_page = """
+ORDER PLACED
+August 13, 2026
+TOTAL
+$115.22
+ORDER # 114-8901234-8901234
+ Viva Naturals Omega 3 Fish Oil Supplement, 120 Pescatarian-Friendly Softgels
+"""
+    pages = [orders_page]
+    monkeypatch.setattr(
+        cli_module,
+        "get_multiline_input_with_custom_submit",
+        lambda _prompt: pages.pop(0),
+    )
+    monkeypatch.setattr(cli_module, "_prompt_line", lambda _message: "")
+
+    cli_module.prompt_for_amazon_data(
+        [_charge_txn("t1", -115220)], MemoGenerator("amazon.com")
+    )
+
+    captured = capsys.readouterr().out
+    assert "have item names but no prices" not in captured
+    assert "Nothing further is needed." in captured

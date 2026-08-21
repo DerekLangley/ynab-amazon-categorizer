@@ -369,6 +369,8 @@ class CoverageSummary:
     without_prices: int = 0
     unmatched: int = 0
     orders_needing_details: list[str] = field(default_factory=list)
+    # Multi-item orders with no per-item prices. Single-item orders are
+    # excluded: there is nothing to split, so a price would change nothing.
     orders_needing_prices: list[str] = field(default_factory=list)
 
     @property
@@ -382,8 +384,7 @@ class CoverageSummary:
 
         Note this does not imply every item has a *price*: an order matched
         from the orders list page has names only. ``without_prices`` counts
-        those and ``orders_needing_prices`` names them, since their details
-        pages would still improve splitting.
+        the ones where that costs something — see ``orders_needing_prices``.
         """
         return self.total > 0 and self.described == self.total
 
@@ -421,7 +422,9 @@ def summarize_coverage(
         mark_match_used(order, used_order_ids, used_charge_keys)
         if order.items:
             summary.described += 1
-            if not order.has_item_prices:
+            # Prices only ever matter for splitting, and only a multi-item
+            # order can be split, so a single-item order is already complete.
+            if not order.has_item_prices and len(order.items) > 1:
                 summary.without_prices += 1
                 if (
                     order.order_id

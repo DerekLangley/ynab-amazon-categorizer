@@ -85,6 +85,9 @@ Matching and memo behavior:
   flow and the coverage survey so their counts cannot drift apart.
 - A charge covering only part of its order is flagged as partial in display and
   memo text, since Amazon does not say which items that shipment covered.
+- Ask for data only where it changes an outcome: per-item prices matter only
+  when splitting, so they are requested at the split, and never for a
+  single-item order.
 - Transaction matching prioritizes amount match with date proximity heuristics.
 - Memo generation should include item context and an order link when available.
 - Missing/partial order data should degrade gracefully rather than crash updates.
