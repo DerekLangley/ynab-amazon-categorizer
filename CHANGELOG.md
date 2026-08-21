@@ -37,7 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   details pages remain an informed choice
 - Every prompt that reports missing information now links the page that would
   supply it — the payments page for unmatched transactions, and each order's
-  details page for orders with no items
+  details page for orders with no items or no item prices
 
 ### Changed
 

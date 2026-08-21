@@ -369,6 +369,7 @@ class CoverageSummary:
     without_prices: int = 0
     unmatched: int = 0
     orders_needing_details: list[str] = field(default_factory=list)
+    orders_needing_prices: list[str] = field(default_factory=list)
 
     @property
     def matched(self) -> int:
@@ -381,7 +382,8 @@ class CoverageSummary:
 
         Note this does not imply every item has a *price*: an order matched
         from the orders list page has names only. ``without_prices`` counts
-        those, since their details pages would still improve splitting.
+        those and ``orders_needing_prices`` names them, since their details
+        pages would still improve splitting.
         """
         return self.total > 0 and self.described == self.total
 
@@ -421,6 +423,11 @@ def summarize_coverage(
             summary.described += 1
             if not order.has_item_prices:
                 summary.without_prices += 1
+                if (
+                    order.order_id
+                    and order.order_id not in summary.orders_needing_prices
+                ):
+                    summary.orders_needing_prices.append(order.order_id)
             continue
 
         summary.without_items += 1

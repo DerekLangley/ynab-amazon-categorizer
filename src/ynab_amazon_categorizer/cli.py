@@ -16,7 +16,11 @@ from prompt_toolkit.key_binding import KeyBindings, KeyPressEvent
 
 from . import __version__
 from .amazon_data import AmazonData
-from .amazon_links import orders_page_url, transactions_page_url
+from .amazon_links import (
+    order_details_url,
+    orders_page_url,
+    transactions_page_url,
+)
 from .amazon_parser import AmazonParser, Order, PageKind, detect_page_kind
 from .batch import process_batch
 from .config import Config
@@ -116,7 +120,16 @@ def absorb_amazon_page(
 MAX_LISTED_ORDER_IDS = 8
 
 
-def _print_coverage(summary: CoverageSummary, memo_generator: MemoGenerator) -> None:
+def _print_order_links(order_ids: list[str], domain: str, indent: str) -> None:
+    """List order-details links, capped so a long run does not flood the screen."""
+    for order_id in order_ids[:MAX_LISTED_ORDER_IDS]:
+        print(f"{indent}{order_details_url(domain, order_id) or order_id}")
+    remaining = len(order_ids) - MAX_LISTED_ORDER_IDS
+    if remaining > 0:
+        print(f"{indent}... and {remaining} more order(s)")
+
+
+def _print_coverage(summary: CoverageSummary, domain: str) -> None:
     """Report which pending transactions the pasted pages can already explain.
 
     Because transactions are fetched before this prompt, the tool knows exactly
@@ -136,15 +149,10 @@ def _print_coverage(summary: CoverageSummary, memo_generator: MemoGenerator) -> 
     if summary.without_items:
         print(f"    • {summary.without_items} matched an order with no item data.")
 
-    for order_id in summary.orders_needing_details[:MAX_LISTED_ORDER_IDS]:
-        link = memo_generator.generate_amazon_order_link(order_id)
-        print(f"        {link or order_id}")
-    remaining = len(summary.orders_needing_details) - MAX_LISTED_ORDER_IDS
-    if remaining > 0:
-        print(f"        ... and {remaining} more order(s)")
+    _print_order_links(summary.orders_needing_details, domain, "        ")
 
 
-def _confirm_more_pages(summary: CoverageSummary) -> bool:
+def _confirm_more_pages(summary: CoverageSummary, domain: str) -> bool:
     """Ask whether to keep pasting once every transaction is already covered.
 
     Without this the loop kept presenting a paste box after there was nothing
@@ -157,9 +165,10 @@ def _confirm_more_pages(summary: CoverageSummary) -> bool:
         # matched from the orders list page has item names but no prices.
         print(
             f"  {summary.without_prices} transaction(s) have item names but no "
-            "prices — their\n    order details pages would make splits exact. "
-            "Optional."
+            "prices. Optional:\n    paste these order details pages to make "
+            "splits exact."
         )
+        _print_order_links(summary.orders_needing_prices, domain, "        ")
     else:
         print("  Nothing further is needed.")
 
@@ -234,14 +243,16 @@ def prompt_for_amazon_data(
 
         if pending:
             summary = summarize_coverage(pending, amazon_data)
-            _print_coverage(summary, links)
+            _print_coverage(summary, links.amazon_domain)
             _print_coverage_advice(summary, links.amazon_domain)
-            if summary.is_complete and not _confirm_more_pages(summary):
+            if summary.is_complete and not _confirm_more_pages(
+                summary, links.amazon_domain
+            ):
                 break
 
     _print_amazon_data_summary(amazon_data)
     if pending and amazon_data:
-        _print_coverage(summarize_coverage(pending, amazon_data), links)
+        _print_coverage(summarize_coverage(pending, amazon_data), links.amazon_domain)
     return amazon_data
 
 

@@ -615,3 +615,41 @@ def test_summarize_coverage_reports_no_missing_prices_for_priced_orders() -> Non
 
     assert summary.is_complete
     assert summary.without_prices == 0
+
+
+def test_summarize_coverage_names_orders_needing_prices() -> None:
+    """Knowing the count is not enough — the user needs the order to go fetch."""
+    order = _make_order(
+        order_id="114-8901234-8901234", total=42.68, date_str="August 13, 2026"
+    )
+    summary = summarize_coverage([_txn(-42.68)], AmazonData(orders=[order]))
+
+    assert summary.orders_needing_prices == ["114-8901234-8901234"]
+
+
+def test_summarize_coverage_lists_a_price_gap_once_per_order() -> None:
+    """Two charges against one order are one page to fetch, not two."""
+    order = _make_order(
+        order_id="114-1234567-1234567", total=157.90, date_str="August 13, 2026"
+    )
+    order.items = ["Widget A", "Widget B"]
+    data = AmazonData(
+        orders=[order], charges=[_make_charge(-115.22), _make_charge(-42.68)]
+    )
+
+    summary = summarize_coverage([_txn(-115.22), _txn(-42.68)], data)
+
+    assert summary.without_prices == 2
+    assert summary.orders_needing_prices == ["114-1234567-1234567"]
+
+
+def test_summarize_coverage_omits_priced_orders_from_the_price_gap() -> None:
+    order = _make_order(
+        order_id="114-8901234-8901234", total=42.68, date_str="August 13, 2026"
+    )
+    order.detailed_items = [OrderItem("Widget A", 42.68)]
+    order.item_prices = [42.68]
+
+    summary = summarize_coverage([_txn(-42.68)], AmazonData(orders=[order]))
+
+    assert summary.orders_needing_prices == []

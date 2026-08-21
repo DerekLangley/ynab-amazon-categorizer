@@ -2139,3 +2139,35 @@ def test_process_transaction_links_transactions_page_when_unmatched(
     captured = capsys.readouterr().out
     assert "No matching order found" in captured
     assert "https://www.amazon.ca/cpe/yourpayments/transactions" in captured
+
+
+def test_price_gap_prompt_links_the_orders_to_fetch(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A count alone leaves the user hunting; link the order pages instead."""
+    orders_page = """
+ORDER PLACED
+August 13, 2026
+TOTAL
+$115.22
+ORDER # 114-8901234-8901234
+ Amazon Basics Low-Odor Dry Erase Whiteboard Markers, 4-Pack
+"""
+    pages = [orders_page]
+    monkeypatch.setattr(
+        cli_module,
+        "get_multiline_input_with_custom_submit",
+        lambda _prompt: pages.pop(0),
+    )
+    monkeypatch.setattr(cli_module, "_prompt_line", lambda _message: "")
+
+    cli_module.prompt_for_amazon_data(
+        [_charge_txn("t1", -115220)], MemoGenerator("amazon.ca")
+    )
+
+    captured = capsys.readouterr().out
+    assert "have item names but no prices" in captured
+    assert (
+        "https://www.amazon.ca/gp/your-account/order-details"
+        "?ie=UTF8&orderID=114-8901234-8901234" in captured
+    )
