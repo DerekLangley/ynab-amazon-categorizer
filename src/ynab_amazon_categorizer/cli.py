@@ -4,7 +4,7 @@ import dataclasses
 import json
 import logging
 import os
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
 import requests
@@ -31,7 +31,12 @@ from .payloads import (
     build_split_payload,
 )
 from .tax import tax_rate_for_category as _tax_rate_for_category
-from .transaction_matcher import TransactionMatcher
+from .transaction_matcher import (
+    CoverageSummary,
+    TransactionMatcher,
+    mark_match_used,
+    summarize_coverage,
+)
 from .transactions import fetch_amazon_transactions
 from .ynab_client import YNABClient
 
@@ -101,8 +106,57 @@ def absorb_amazon_page(
     return kind
 
 
+# How many order IDs to name before collapsing the rest into a count.
+MAX_LISTED_ORDER_IDS = 8
+
+
+def _print_coverage(summary: CoverageSummary, memo_generator: MemoGenerator) -> None:
+    """Report which pending transactions the pasted pages can already explain.
+
+    Because transactions are fetched before this prompt, the tool knows exactly
+    which orders are still worth fetching and can name them, instead of leaving
+    the user to discover the gaps one transaction at a time.
+    """
+    if not summary.total:
+        return
+
+    print(
+        f"\n  Coverage: {summary.described} of {summary.total} "
+        "transaction(s) matched with item details."
+    )
+
+    if summary.unmatched:
+        print(f"    • {summary.unmatched} with no matching order yet.")
+    if summary.without_items:
+        print(f"    • {summary.without_items} matched an order with no item data.")
+
+    for order_id in summary.orders_needing_details[:MAX_LISTED_ORDER_IDS]:
+        link = memo_generator.generate_amazon_order_link(order_id)
+        print(f"        {link or order_id}")
+    remaining = len(summary.orders_needing_details) - MAX_LISTED_ORDER_IDS
+    if remaining > 0:
+        print(f"        ... and {remaining} more order(s)")
+
+
+def _print_coverage_advice(summary: CoverageSummary, amazon_data: AmazonData) -> None:
+    """Suggest the page most likely to close the remaining gap."""
+    if summary.is_complete:
+        print("  ✓ Every transaction has an order and its items.")
+        return
+    if summary.unmatched and not amazon_data.charges:
+        print(
+            "  → Paste the Your Transactions page: it maps each card charge to "
+            "its\n    order, which is what unmatched transactions usually need."
+        )
+    if summary.orders_needing_details:
+        print(
+            "  → Paste the order details page for the order(s) listed above to "
+            "get\n    their items and prices."
+        )
+
+
 def _print_amazon_data_summary(amazon_data: AmazonData) -> None:
-    """Summarize what was gathered and what is still missing."""
+    """Summarize what was gathered."""
     if not amazon_data:
         print("\nNo Amazon data provided.")
         return
@@ -120,24 +174,23 @@ def _print_amazon_data_summary(amazon_data: AmazonData) -> None:
     if len(amazon_data.orders) > 3:
         print(f"  ... and {len(amazon_data.orders) - 3} more orders")
 
-    missing = amazon_data.unknown_charge_order_ids()
-    if missing:
-        print(
-            f"\n  {len(missing)} order(s) are named by a charge but have no item "
-            "data yet."
-        )
-        print(
-            "  Matching transactions will still get an order link, and you can "
-            "paste\n  those order details pages when they come up."
-        )
 
+def prompt_for_amazon_data(
+    transactions: Sequence[Mapping[str, Any]] | None = None,
+    memo_generator: MemoGenerator | None = None,
+) -> AmazonData:
+    """Collect any number of Amazon pages, in any order, into one dataset.
 
-def prompt_for_amazon_data() -> AmazonData:
-    """Collect any number of Amazon pages, in any order, into one dataset."""
+    When the pending ``transactions`` are supplied, each paste is followed by a
+    coverage report naming the orders still missing item data, so the user can
+    fetch exactly those pages before moving on.
+    """
     _print_amazon_data_instructions()
 
     parser = AmazonParser()
     amazon_data = AmazonData()
+    pending = list(transactions or [])
+    links = memo_generator or MemoGenerator()
     page_number = 1
 
     while True:
@@ -150,7 +203,14 @@ def prompt_for_amazon_data() -> AmazonData:
         absorb_amazon_page(amazon_data, page_text, parser)
         page_number += 1
 
+        if pending:
+            summary = summarize_coverage(pending, amazon_data)
+            _print_coverage(summary, links)
+            _print_coverage_advice(summary, amazon_data)
+
     _print_amazon_data_summary(amazon_data)
+    if pending and amazon_data:
+        _print_coverage(summarize_coverage(pending, amazon_data), links)
     return amazon_data
 
 
@@ -745,26 +805,6 @@ def _resolve_split_memo(
     return _prompt_split_memo_confirmation(suggested_split_memo, category_name)
 
 
-def _mark_match_used(
-    matching_order: Order,
-    used_order_ids: set[str] | None,
-    used_charge_keys: set[tuple[str, str, str]] | None,
-) -> None:
-    """Record a match as consumed so a later transaction cannot reuse it.
-
-    A charge-based match consumes only that charge row: a multi-shipment order
-    produces several charges and therefore several transactions, so retiring
-    the whole order would strand the rest of them.
-    """
-    charge = matching_order.matched_charge
-    if charge is not None:
-        if used_charge_keys is not None:
-            used_charge_keys.add(charge.key)
-        return
-    if used_order_ids is not None and matching_order.order_id is not None:
-        used_order_ids.add(matching_order.order_id)
-
-
 def process_transaction(
     transaction: Mapping[str, Any],
     index: int,
@@ -903,7 +943,7 @@ def process_transaction(
                 # transaction of the same amount. Skip in dry-run because
                 # nothing was actually applied.
                 if not dry_run and matching_order is not None:
-                    _mark_match_used(matching_order, used_order_ids, used_charge_keys)
+                    mark_match_used(matching_order, used_order_ids, used_charge_keys)
                 return True
             # result == "continue" means back to action prompt
             continue
@@ -1144,7 +1184,7 @@ def _run(argv: list[str] | None = None) -> int:
 
     amazon_data: AmazonData | None = None
     if provide_orders == "y":
-        amazon_data = prompt_for_amazon_data()
+        amazon_data = prompt_for_amazon_data(transactions_to_process, memo_generator)
         if not amazon_data:
             print("No usable Amazon data found in provided text.")
 

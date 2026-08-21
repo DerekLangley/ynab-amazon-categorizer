@@ -57,7 +57,9 @@ Data flow:
    order details page, and/or the payments/transactions page.
 2. `detect_page_kind` routes each paste to its parser; `AmazonData` merges the
    results, with order-details data winning over the orders list.
-3. Tool fetches uncategorized YNAB transactions.
+3. Tool fetches uncategorized YNAB transactions *before* prompting, so the
+   paste loop can report coverage and name the orders still missing details
+   (`summarize_coverage`).
 4. Matcher resolves each transaction to an order, charges first.
 5. CLI guides category updates and split transactions.
 6. Tool updates YNAB memos/categories via API.
@@ -78,6 +80,8 @@ Matching and memo behavior:
   amount match against order totals; order totals remain the fallback.
 - `used_order_ids` and `used_charge_keys` are tracked separately: one order
   legitimately produces several charges, hence several transactions.
+  `mark_match_used` is the single consumption policy, shared by the interactive
+  flow and the coverage survey so their counts cannot drift apart.
 - A charge covering only part of its order is flagged as partial in display and
   memo text, since Amazon does not say which items that shipment covered.
 - Transaction matching prioritizes amount match with date proximity heuristics.

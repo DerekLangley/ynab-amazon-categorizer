@@ -1,11 +1,17 @@
 """Tests for transaction matching functionality."""
 
+from dataclasses import replace
+
 import pytest
 
 from ynab_amazon_categorizer.amazon_data import AmazonData
 from ynab_amazon_categorizer.amazon_parser import Order
 from ynab_amazon_categorizer.models import AmazonCharge
-from ynab_amazon_categorizer.transaction_matcher import TransactionMatcher
+from ynab_amazon_categorizer.transaction_matcher import (
+    TransactionMatcher,
+    mark_match_used,
+    summarize_coverage,
+)
 
 
 def _make_order(
@@ -490,3 +496,98 @@ def test_resolve_confident_order_skips_an_ambiguous_charge() -> None:
     data = AmazonData(charges=charges)
 
     assert matcher.resolve_confident_order(-20.00, "2026-08-16", data) is None
+
+
+# --- coverage summary --------------------------------------------------------
+
+
+def _txn(amount: float, date: str = "2026-08-16") -> dict[str, object]:
+    return {"id": "t", "date": date, "amount": int(round(amount * 1000))}
+
+
+def test_summarize_coverage_counts_an_empty_dataset_as_unmatched() -> None:
+    summary = summarize_coverage([_txn(-42.68), _txn(-115.22)], AmazonData())
+
+    assert (summary.total, summary.described, summary.unmatched) == (2, 0, 2)
+    assert not summary.is_complete
+
+
+def test_summarize_coverage_counts_described_transactions() -> None:
+    order = _make_order(
+        order_id="114-1234567-1234567", total=157.90, date_str="August 13, 2026"
+    )
+    data = AmazonData(orders=[order], charges=[_make_charge(-42.68)])
+
+    summary = summarize_coverage([_txn(-42.68)], data)
+
+    assert summary.described == 1
+    assert summary.orders_needing_details == []
+    assert summary.is_complete
+
+
+def test_summarize_coverage_names_orders_missing_item_data() -> None:
+    """The whole point: say which details pages are still worth fetching."""
+    data = AmazonData(
+        charges=[
+            _make_charge(-16.42, "114-4567890-4567890", "August 7, 2026"),
+            _make_charge(-10.20, "111-5678901-5678901", "August 8, 2026"),
+        ]
+    )
+
+    summary = summarize_coverage(
+        [_txn(-16.42, "2026-08-09"), _txn(-10.20, "2026-08-09")], data
+    )
+
+    assert summary.without_items == 2
+    assert summary.described == 0
+    assert summary.orders_needing_details == [
+        "114-4567890-4567890",
+        "111-5678901-5678901",
+    ]
+
+
+def test_summarize_coverage_lists_an_order_once_for_several_charges() -> None:
+    order_id = "114-1234567-1234567"
+    data = AmazonData(charges=[_make_charge(-115.22), _make_charge(-42.68)])
+
+    summary = summarize_coverage([_txn(-115.22), _txn(-42.68)], data)
+
+    assert summary.without_items == 2
+    assert summary.orders_needing_details == [order_id]
+
+
+def test_summarize_coverage_does_not_let_two_transactions_share_one_charge() -> None:
+    """Consuming matches keeps the count honest for same-amount transactions."""
+    data = AmazonData(charges=[_make_charge(-42.68)])
+
+    summary = summarize_coverage([_txn(-42.68), _txn(-42.68)], data)
+
+    assert summary.matched == 1
+    assert summary.unmatched == 1
+
+
+def test_summarize_coverage_ignores_orders_with_no_pending_transaction() -> None:
+    """Only orders behind a real transaction are worth asking the user for."""
+    data = AmazonData(
+        charges=[
+            _make_charge(-16.42, "114-4567890-4567890", "August 7, 2026"),
+            _make_charge(-99.99, "114-0000000-0000000", "August 7, 2026"),
+        ]
+    )
+
+    summary = summarize_coverage([_txn(-16.42, "2026-08-09")], data)
+
+    assert summary.orders_needing_details == ["114-4567890-4567890"]
+
+
+def test_mark_match_used_is_the_shared_consumption_policy() -> None:
+    order = _make_order(order_id="114-1234567-1234567", total=157.90)
+    charged = replace(order, matched_charge=_make_charge(-42.68))
+    used_orders: set[str] = set()
+    used_charges: set[tuple[str, str, str]] = set()
+
+    mark_match_used(charged, used_orders, used_charges)
+    assert used_orders == set() and len(used_charges) == 1
+
+    mark_match_used(order, used_orders, used_charges)
+    assert used_orders == {"114-1234567-1234567"}

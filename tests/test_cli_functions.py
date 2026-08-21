@@ -42,7 +42,10 @@ from ynab_amazon_categorizer.payloads import (
     build_single_payload,
     build_split_payload,
 )
-from ynab_amazon_categorizer.transaction_matcher import TransactionMatcher
+from ynab_amazon_categorizer.transaction_matcher import (
+    TransactionMatcher,
+    mark_match_used,
+)
 from ynab_amazon_categorizer.transactions import (
     fetch_amazon_transactions,
     is_amazon_payee,
@@ -1429,7 +1432,7 @@ def test_main_batch_dry_run_smoke(
     monkeypatch.setattr(
         cli_module,
         "prompt_for_amazon_data",
-        lambda: AmazonData.from_orders([_batch_order()]),
+        lambda *_args, **_kwargs: AmazonData.from_orders([_batch_order()]),
     )
     monkeypatch.setattr(
         cli_module,
@@ -1657,7 +1660,7 @@ def test_mark_match_used_retires_the_charge_not_the_order() -> None:
         -115.22, "2026-08-16", data, used_orders, used_charges
     )
     assert first is not None
-    cli_module._mark_match_used(first, used_orders, used_charges)
+    mark_match_used(first, used_orders, used_charges)
 
     assert used_orders == set()
     assert len(used_charges) == 1
@@ -1674,7 +1677,7 @@ def test_mark_match_used_retires_the_order_for_a_total_match() -> None:
     used_orders: set[str] = set()
     used_charges: set[tuple[str, str, str]] = set()
 
-    cli_module._mark_match_used(_batch_order(), used_orders, used_charges)
+    mark_match_used(_batch_order(), used_orders, used_charges)
 
     assert used_orders == {"702-1234567-7654321"}
     assert used_charges == set()
@@ -1865,3 +1868,108 @@ def test_generate_split_summary_memo_marks_a_partial_charge() -> None:
 
 def test_generate_split_summary_memo_unmarked_for_a_whole_order() -> None:
     assert "part of" not in generate_split_summary_memo(_shipment_data().orders[0])
+
+
+# --- coverage reporting in the paste loop -----------------------------------
+
+
+def test_prompt_for_amazon_data_reports_coverage_after_each_page(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Fetching transactions first lets the paste loop name what is missing."""
+    transactions_page = """
+August 15, 2026
+Prime Visa ****1234-$115.22
+Order #114-1234567-1234567
+AMZN Mktp US
+Prime Visa ****1234-$16.42
+Order #114-4567890-4567890
+Amazon.com
+"""
+    pages = [transactions_page, ""]
+    monkeypatch.setattr(
+        cli_module,
+        "get_multiline_input_with_custom_submit",
+        lambda _prompt: pages.pop(0),
+    )
+    pending = [_charge_txn("t1", -115220), _charge_txn("t2", -16420, "2026-08-16")]
+
+    cli_module.prompt_for_amazon_data(pending, MemoGenerator("amazon.com"))
+
+    captured = capsys.readouterr().out
+    assert "Coverage: 0 of 2 transaction(s) matched with item details." in captured
+    assert "2 matched an order with no item data." in captured
+    # The orders worth fetching are named, with a clickable link.
+    assert "orderID=114-1234567-1234567" in captured
+    assert "orderID=114-4567890-4567890" in captured
+
+
+def test_prompt_for_amazon_data_suggests_the_transactions_page(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An unmatched transaction with no charges on hand points at page 3."""
+    orders_page = """
+ORDER PLACED
+August 13, 2026
+TOTAL
+$5.18
+ORDER # 114-8901234-8901234
+ Amazon Basics Low-Odor Dry Erase Whiteboard Markers, 4-Pack
+"""
+    pages = [orders_page, ""]
+    monkeypatch.setattr(
+        cli_module,
+        "get_multiline_input_with_custom_submit",
+        lambda _prompt: pages.pop(0),
+    )
+
+    cli_module.prompt_for_amazon_data(
+        [_charge_txn("t1", -115220)], MemoGenerator("amazon.com")
+    )
+
+    captured = capsys.readouterr().out
+    assert "1 with no matching order yet." in captured
+    assert "Paste the Your Transactions page" in captured
+
+
+def test_prompt_for_amazon_data_confirms_full_coverage(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    orders_page = """
+ORDER PLACED
+August 13, 2026
+TOTAL
+$115.22
+ORDER # 114-8901234-8901234
+ Amazon Basics Low-Odor Dry Erase Whiteboard Markers, 4-Pack
+"""
+    pages = [orders_page, ""]
+    monkeypatch.setattr(
+        cli_module,
+        "get_multiline_input_with_custom_submit",
+        lambda _prompt: pages.pop(0),
+    )
+
+    cli_module.prompt_for_amazon_data(
+        [_charge_txn("t1", -115220)], MemoGenerator("amazon.com")
+    )
+
+    captured = capsys.readouterr().out
+    assert "Coverage: 1 of 1 transaction(s) matched with item details." in captured
+    assert "Every transaction has an order and its items." in captured
+
+
+def test_prompt_for_amazon_data_stays_quiet_without_transactions(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Callers that pass no transactions get the old, unannotated flow."""
+    pages = ["unrelated notes", ""]
+    monkeypatch.setattr(
+        cli_module,
+        "get_multiline_input_with_custom_submit",
+        lambda _prompt: pages.pop(0),
+    )
+
+    cli_module.prompt_for_amazon_data()
+
+    assert "Coverage:" not in capsys.readouterr().out

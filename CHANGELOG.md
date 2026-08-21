@@ -28,6 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   details page as the base amount
 - Batch mode enriches charge-matched transactions too, including both
   transactions of a two-shipment order
+- Because transactions are now fetched first, the paste prompt reports coverage
+  after every page — how many transactions it can fully describe, and a linked
+  list of the exact orders whose details pages are still worth fetching — plus
+  a hint at which page will close the remaining gap
 
 ### Changed
 

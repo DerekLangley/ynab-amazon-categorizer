@@ -1,8 +1,9 @@
 """Transaction matching functionality."""
 
-from collections.abc import Sequence
-from dataclasses import replace
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from datetime import datetime
+from typing import Any
 
 from .amazon_data import AmazonData
 from .amazon_parser import Order
@@ -336,3 +337,86 @@ def _order_for_charge(charge: AmazonCharge, amazon_data: AmazonData) -> Order:
             matched_charge=charge,
         )
     return replace(order, matched_charge=charge)
+
+
+def mark_match_used(
+    matching_order: Order,
+    used_order_ids: set[str] | None,
+    used_charge_keys: set[tuple[str, str, str]] | None,
+) -> None:
+    """Record a match as consumed so a later transaction cannot reuse it.
+
+    A charge-based match consumes only that charge row: a multi-shipment order
+    produces several charges and therefore several transactions, so retiring
+    the whole order would strand the rest of them.
+    """
+    charge = matching_order.matched_charge
+    if charge is not None:
+        if used_charge_keys is not None:
+            used_charge_keys.add(charge.key)
+        return
+    if used_order_ids is not None and matching_order.order_id is not None:
+        used_order_ids.add(matching_order.order_id)
+
+
+@dataclass(slots=True)
+class CoverageSummary:
+    """How much of a transaction set the Amazon data on hand can describe."""
+
+    total: int = 0
+    described: int = 0
+    without_items: int = 0
+    unmatched: int = 0
+    orders_needing_details: list[str] = field(default_factory=list)
+
+    @property
+    def matched(self) -> int:
+        """Transactions resolved to an order, with or without item data."""
+        return self.described + self.without_items
+
+    @property
+    def is_complete(self) -> bool:
+        """True when every transaction has an order *and* its items."""
+        return self.total > 0 and self.described == self.total
+
+
+def summarize_coverage(
+    transactions: Sequence[Mapping[str, Any]], amazon_data: AmazonData
+) -> CoverageSummary:
+    """Report what the pasted pages can and cannot explain, before categorizing.
+
+    Run while collecting pages, this turns a blind paste loop into a checklist:
+    it names the exact orders whose details pages are still worth fetching,
+    rather than letting the user discover the gaps one transaction at a time.
+
+    Matches are consumed as the survey goes, exactly as the real run consumes
+    them, so two same-amount transactions cannot both claim one charge and
+    inflate the count.
+    """
+    matcher = TransactionMatcher()
+    summary = CoverageSummary(total=len(transactions))
+    used_order_ids: set[str] = set()
+    used_charge_keys: set[tuple[str, str, str]] = set()
+
+    for transaction in transactions:
+        order = matcher.resolve_order(
+            transaction["amount"] / 1000.0,
+            transaction["date"],
+            amazon_data,
+            used_order_ids,
+            used_charge_keys,
+        )
+        if order is None:
+            summary.unmatched += 1
+            continue
+
+        mark_match_used(order, used_order_ids, used_charge_keys)
+        if order.items:
+            summary.described += 1
+            continue
+
+        summary.without_items += 1
+        if order.order_id and order.order_id not in summary.orders_needing_details:
+            summary.orders_needing_details.append(order.order_id)
+
+    return summary

@@ -165,6 +165,19 @@ including both transactions of a two-shipment order.
 
    Select all and copy the whole page each time.
 
+   After each paste the tool reports coverage against your pending
+   transactions and links the exact orders it still needs details for:
+
+   ```
+   ✓ Transactions page: 20 new charge(s) linked to orders.
+
+     Coverage: 5 of 8 transaction(s) matched with item details.
+       • 3 matched an order with no item data.
+           https://www.amazon.com/gp/your-account/order-details?...orderID=114-...
+     → Paste the order details page for the order(s) listed above to get
+       their items and prices.
+   ```
+
 2. **Review Matched Transactions**:
    - The script shows order details, items, and links before asking to categorize
    - For multiple items, it suggests splitting the transaction
