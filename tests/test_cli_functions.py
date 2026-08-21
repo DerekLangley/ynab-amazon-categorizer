@@ -453,7 +453,7 @@ def test_process_transaction_displays_inflow_amount_without_negating(
 
     captured = capsys.readouterr().out
     assert result is True
-    assert "Found inflow transaction: Amazon $10.00" in captured
+    assert "This is an inflow (refund or credit)." in captured
     assert "Amount: 10.00" in captured
 
 
@@ -494,8 +494,8 @@ def test_process_transaction_uses_matched_order_currency_for_inflow(
 
     assert result is True
     captured = capsys.readouterr().out
-    assert "Found inflow transaction: Amazon £10.00" in captured
-    assert "Found inflow transaction: Amazon $10.00" not in captured
+    assert "Amount: £10.00" in captured
+    assert "Amount: $10.00" not in captured
 
 
 # --- generate_split_summary_memo tests ---
@@ -2296,3 +2296,151 @@ ORDER # 114-8901234-8901234
     captured = capsys.readouterr().out
     assert "have item names but no prices" not in captured
     assert "Nothing further is needed." in captured
+
+
+def test_unmatched_inflow_is_skipped_without_being_asked_about(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Answering yes could not have changed anything, so do not ask."""
+    asked: list[str] = []
+    monkeypatch.setattr(
+        cli_module, "_prompt_line", lambda message: (asked.append(message), "s")[1]
+    )
+    transaction = _charge_txn("t1", 19360, "2026-08-09")
+    stats: dict[str, int] = {}
+
+    result = process_transaction(
+        transaction,
+        0,
+        1,
+        AmazonData.from_orders([_batch_order()]),  # nothing matches +19.36
+        MemoGenerator("amazon.com"),
+        Mock(),
+        Mock(),
+        {},
+        {},
+        set(),
+        False,
+        stats,
+    )
+
+    assert result is True
+    assert stats["auto_skipped_no_match"] == 1
+    assert not any("inflow" in message.lower() for message in asked)
+
+
+def test_matched_inflow_is_asked_about_after_its_order_is_shown(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The decision comes with the refund and its order already in view."""
+    refund = AmazonCharge(
+        amount=19.36,
+        date_str="August 8, 2026",
+        order_id="114-3456789-3456789",
+        is_refund=True,
+        currency="$",
+    )
+    responses = iter(["n"])
+    monkeypatch.setattr(
+        cli_module, "_prompt_line", lambda _message: next(responses, "s")
+    )
+
+    process_transaction(
+        _charge_txn("t1", 19360, "2026-08-09"),
+        0,
+        1,
+        AmazonData(charges=[refund]),
+        MemoGenerator("amazon.com"),
+        Mock(),
+        Mock(),
+        {},
+        {},
+        set(),
+        False,
+        {},
+    )
+
+    captured = capsys.readouterr().out
+    # The order details precede the question about it.
+    assert captured.index("Refund: $19.36") < captured.index(
+        "This is an inflow (refund or credit)."
+    )
+    assert "Skipping inflow transaction." in captured
+
+
+def test_declined_inflow_is_not_asked_to_paste_a_details_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Declining the refund must not cost a paste for data now unused."""
+    refund = AmazonCharge(
+        amount=19.36,
+        date_str="August 8, 2026",
+        order_id="114-3456789-3456789",
+        is_refund=True,
+        currency="$",
+    )
+    asked: list[str] = []
+    monkeypatch.setattr(
+        cli_module, "_prompt_line", lambda message: (asked.append(message), "n")[1]
+    )
+
+    process_transaction(
+        _charge_txn("t1", 19360, "2026-08-09"),
+        0,
+        1,
+        AmazonData(charges=[refund]),
+        MemoGenerator("amazon.com"),
+        Mock(),
+        Mock(),
+        {},
+        {},
+        set(),
+        False,
+        {},
+    )
+
+    assert not any("details page now" in message for message in asked)
+
+
+def test_accepted_inflow_is_offered_the_details_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Proceeding still gets the offer, just after the decision to proceed."""
+    refund = AmazonCharge(
+        amount=19.36,
+        date_str="August 8, 2026",
+        order_id="114-3456789-3456789",
+        is_refund=True,
+        currency="$",
+    )
+    asked: list[str] = []
+    answers = iter(["y", "n", "s"])  # process inflow, decline paste, skip
+
+    def record(message: str) -> str:
+        asked.append(message)
+        return next(answers, "s")
+
+    monkeypatch.setattr(cli_module, "_prompt_line", record)
+
+    process_transaction(
+        _charge_txn("t1", 19360, "2026-08-09"),
+        0,
+        1,
+        AmazonData(charges=[refund]),
+        MemoGenerator("amazon.com"),
+        Mock(),
+        Mock(),
+        {},
+        {},
+        set(),
+        False,
+        {},
+    )
+
+    inflow_index = next(
+        i for i, message in enumerate(asked) if "Process this inflow?" in message
+    )
+    paste_index = next(
+        i for i, message in enumerate(asked) if "details page now" in message
+    )
+    assert inflow_index < paste_index

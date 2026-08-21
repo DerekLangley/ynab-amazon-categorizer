@@ -50,6 +50,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   skipped
 - Data-entry instructions are three lines instead of eleven
 
+- Prompts are ordered so a decision is never asked before the information it
+  depends on: the inflow question comes after the matched refund and its order
+  are displayed, and the offer to paste an order's details page comes after the
+  decision to process the transaction at all
+- An inflow that matched nothing is skipped without being asked about, since
+  processing it could not have done anything
+
 ### Fixed
 
 - Page links use the configured `AMAZON_DOMAIN` instead of a hardcoded

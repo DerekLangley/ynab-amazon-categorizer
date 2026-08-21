@@ -601,9 +601,10 @@ def _get_item_details(
             "date": matching_order.date_str,
         }
 
-    # Ask if user wants to enter item details manually
+    # Reached only when no Amazon data was provided this run: a transaction
+    # that data failed to match is auto-skipped before here.
     manual_entry = _prompt_line(
-        "No order match found. Enter item details manually? (y/n, default n): "
+        "No Amazon order data. Enter item details manually? (y/n, default n): "
     ).lower()
     if manual_entry == "y":
         return prompt_for_item_details()
@@ -900,19 +901,6 @@ def process_transaction(
             amount_float, date, amazon_data, used_order_ids, used_charge_keys
         )
 
-    if amount_milliunits > 0:
-        currency = matching_order.currency if matching_order else None
-        print(
-            f"Found inflow transaction: {payee} "
-            f"{format_currency_amount(amount_float, currency)}"
-        )
-        process_inflow = _prompt_line(
-            "Process this inflow (refund/credit)? (y/n, default n): "
-        ).lower()
-        if process_inflow != "y":
-            print("Skipping inflow transaction.")
-            return True
-
     print(f"\n--- Processing Transaction {index + 1}/{total} ---")
     print(f"  ID:   {transaction_id}")
     print(f"  Date: {date}")
@@ -933,21 +921,6 @@ def process_transaction(
     # Try to find matching order from parsed data and show it
     if amazon_data:
         if matching_order:
-            # A charge can name an order none of the pasted pages described.
-            # That is worth one more prompt: its details page is the
-            # difference between an order link and a real item list.
-            if (
-                not matching_order.items
-                and matching_order.matched_charge is not None
-                and matching_order.order_id
-            ):
-                filled = prompt_for_order_details(
-                    amazon_data, matching_order.order_id, memo_generator
-                )
-                if filled is not None:
-                    matching_order = dataclasses.replace(
-                        filled, matched_charge=matching_order.matched_charge
-                    )
             display_matched_order(matching_order, memo_generator)
         else:
             # Amazon data was provided for this run, but nothing matched this
@@ -974,6 +947,37 @@ def process_transaction(
                     stats.get("auto_skipped_no_match", 0) + 1
                 )
             return True
+
+    if amount_milliunits > 0:
+        # Asked here rather than before the details above, so the answer is
+        # given with the refund and its order in view. An unmatched inflow
+        # has already been skipped, so this is never asked about a
+        # transaction nothing could be done with anyway.
+        print("  This is an inflow (refund or credit).")
+        process_inflow = _prompt_line("Process this inflow? (y/n, default n): ").lower()
+        if process_inflow != "y":
+            print("Skipping inflow transaction.")
+            return True
+
+    # A charge can name an order none of the pasted pages described, and its
+    # details page is the difference between an order link and a real item
+    # list. Asked only now, once this transaction is definitely being worked:
+    # an inflow the user declines above must not cost them a paste first.
+    if (
+        amazon_data
+        and matching_order is not None
+        and not matching_order.items
+        and matching_order.matched_charge is not None
+        and matching_order.order_id
+    ):
+        filled = prompt_for_order_details(
+            amazon_data, matching_order.order_id, memo_generator
+        )
+        if filled is not None:
+            matching_order = dataclasses.replace(
+                filled, matched_charge=matching_order.matched_charge
+            )
+            display_matched_order(matching_order, memo_generator)
 
     while True:  # Action loop (c, s, q)
         action = _prompt_line(
@@ -1076,14 +1080,13 @@ def _handle_categorize(
 
     if should_offer_split:
         print("There is more than one item in this transaction.")
-        split_decision = _prompt_line(
-            "Split this transaction? (y/n, default n): "
-        ).lower()
     elif _env_flag("YNAB_SKIP_SPLIT_PROMPT_SINGLE_ITEM"):
-        # Only one item (or no matched order) — nothing to split, and the
-        # user has opted via .env to skip asking about it every time.
+        # Only one item (or no matched order). A split across categories is
+        # still possible, so this is not asked-for-nothing, but the user has
+        # opted via .env to skip being asked every time.
         split_decision = "n"
-    else:
+
+    if should_offer_split or not _env_flag("YNAB_SKIP_SPLIT_PROMPT_SINGLE_ITEM"):
         split_decision = _prompt_line(
             "Split this transaction? (y/n, default n): "
         ).lower()
