@@ -16,6 +16,7 @@ from prompt_toolkit.key_binding import KeyBindings, KeyPressEvent
 
 from . import __version__
 from .amazon_data import AmazonData
+from .amazon_links import orders_page_url, transactions_page_url
 from .amazon_parser import AmazonParser, Order, PageKind, detect_page_kind
 from .batch import process_batch
 from .config import Config
@@ -55,16 +56,20 @@ def _env_flag(var_name: str, default: bool = False) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "y")
 
 
-def _print_amazon_data_instructions() -> None:
-    """Explain which Amazon pages help and what each one contributes."""
+def _print_amazon_data_instructions(domain: str) -> None:
+    """Explain which Amazon pages help and what each one contributes.
+
+    Links use the configured storefront, so they are clickable rather than
+    pointing at a domain the user does not shop on.
+    """
     print("\n--- Amazon Data Entry ---")
     print("Paste any of these pages; the tool works out which is which.")
     print("  1. Your Orders          - order totals and item names")
-    print("     https://www.amazon.com/your-orders/orders")
+    print(f"     {orders_page_url(domain)}")
     print("  2. Order details        - every item with its price, plus tax")
     print("     (open an order and choose 'View order details')")
     print("  3. Your Transactions    - which card charge paid for which order")
-    print("     https://www.amazon.com/cpe/yourpayments/transactions")
+    print(f"     {transactions_page_url(domain)}")
     print(
         "\nPage 3 is what resolves transactions the orders page alone cannot: an\n"
         "order billed once per shipment, one split with a gift card or points,\n"
@@ -161,15 +166,16 @@ def _confirm_more_pages(summary: CoverageSummary) -> bool:
     return answer.strip().lower() == "y"
 
 
-def _print_coverage_advice(summary: CoverageSummary, amazon_data: AmazonData) -> None:
+def _print_coverage_advice(summary: CoverageSummary, domain: str) -> None:
     """Suggest the page most likely to close the remaining gap."""
     if summary.is_complete:
         return
-    if summary.unmatched and not amazon_data.charges:
+    if summary.unmatched:
         print(
             "  → Paste the Your Transactions page: it maps each card charge to "
             "its\n    order, which is what unmatched transactions usually need."
         )
+        print(f"        {transactions_page_url(domain)}")
     if summary.orders_needing_details:
         print(
             "  → Paste the order details page for the order(s) listed above to "
@@ -207,13 +213,13 @@ def prompt_for_amazon_data(
     coverage report naming the orders still missing item data, so the user can
     fetch exactly those pages before moving on.
     """
-    _print_amazon_data_instructions()
-
     parser = AmazonParser()
     amazon_data = AmazonData()
     pending = list(transactions or [])
     links = memo_generator or MemoGenerator()
     page_number = 1
+
+    _print_amazon_data_instructions(links.amazon_domain)
 
     while True:
         print(f"\nPaste page {page_number} (or submit empty / 'done' to continue):")
@@ -228,7 +234,7 @@ def prompt_for_amazon_data(
         if pending:
             summary = summarize_coverage(pending, amazon_data)
             _print_coverage(summary, links)
-            _print_coverage_advice(summary, amazon_data)
+            _print_coverage_advice(summary, links.amazon_domain)
             if summary.is_complete and not _confirm_more_pages(summary):
                 break
 
@@ -932,6 +938,15 @@ def process_transaction(
                 "  ⚠ No matching order found in parsed Amazon data — "
                 "skipping (nothing to categorize from)."
             )
+            if not amazon_data.charges:
+                # The charge rows are what explain a transaction whose amount
+                # matches no order total, so name that page here rather than
+                # leaving the user to guess what would have helped.
+                print(
+                    "    The Your Transactions page maps this charge to its "
+                    "order:\n    "
+                    f"{transactions_page_url(memo_generator.amazon_domain)}"
+                )
             if stats is not None:
                 stats["auto_skipped_no_match"] = (
                     stats.get("auto_skipped_no_match", 0) + 1
@@ -1258,6 +1273,10 @@ def _run(argv: list[str] | None = None) -> int:
         print(
             f"  ({auto_skipped} auto-skipped: no matching order data for that "
             "transaction)"
+        )
+        print(
+            "  To match these next run, paste your Amazon transactions page:\n"
+            f"    {transactions_page_url(config.amazon_domain)}"
         )
     return 0
 

@@ -37,6 +37,7 @@ Current modules:
 - `src/ynab_amazon_categorizer/cli.py` - main CLI entry point and interactive flow.
 - `src/ynab_amazon_categorizer/amazon_parser.py` - parsing for all three Amazon pages (orders list, order details, payments/transactions) plus page-type detection.
 - `src/ynab_amazon_categorizer/amazon_data.py` - `AmazonData` aggregate that merges orders/details/charges from however many pages were pasted.
+- `src/ynab_amazon_categorizer/amazon_links.py` - storefront-aware URLs for the Amazon pages the tool reads; the single definition of the order-details link.
 - `src/ynab_amazon_categorizer/transaction_matcher.py` - amount/date matching against order totals and against individual charges.
 - `src/ynab_amazon_categorizer/memo_generator.py` - memo and order-link generation.
 - `src/ynab_amazon_categorizer/ynab_client.py` - YNAB API communication.
@@ -111,6 +112,8 @@ YNAB_ACCOUNT_ID=none
 - Never commit real API keys or `.env` contents.
 - Do not print full secrets in logs, tests, or screenshots.
 - When sharing examples, use placeholder credentials.
+- Build Amazon URLs via `amazon_links`, never inline: a hardcoded `amazon.com`
+  link is wrong for every non-US storefront, including the `amazon.ca` default.
 
 ## Agent Notes
 

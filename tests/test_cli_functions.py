@@ -2061,3 +2061,76 @@ ORDER # 114-8901234-8901234
     captured = capsys.readouterr().out
     assert "have item names but no prices" in captured
     assert "Nothing further is needed." not in captured
+
+
+def test_amazon_data_prompt_links_use_the_configured_storefront(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Every link offered must point at the user's own Amazon domain."""
+    pages = [""]
+    monkeypatch.setattr(
+        cli_module,
+        "get_multiline_input_with_custom_submit",
+        lambda _prompt: pages.pop(0),
+    )
+
+    cli_module.prompt_for_amazon_data([], MemoGenerator("amazon.co.uk"))
+
+    captured = capsys.readouterr().out
+    assert "https://www.amazon.co.uk/your-orders/orders" in captured
+    assert "https://www.amazon.co.uk/cpe/yourpayments/transactions" in captured
+    assert "amazon.com/" not in captured
+
+
+def test_unmatched_coverage_links_the_transactions_page(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An unmatched transaction gets a clickable route to the fix."""
+    orders_page = """
+ORDER PLACED
+August 13, 2026
+TOTAL
+$5.18
+ORDER # 114-8901234-8901234
+ Amazon Basics Low-Odor Dry Erase Whiteboard Markers, 4-Pack
+"""
+    pages = [orders_page, ""]
+    monkeypatch.setattr(
+        cli_module,
+        "get_multiline_input_with_custom_submit",
+        lambda _prompt: pages.pop(0),
+    )
+
+    cli_module.prompt_for_amazon_data(
+        [_charge_txn("t1", -115220)], MemoGenerator("amazon.com")
+    )
+
+    captured = capsys.readouterr().out
+    assert "1 with no matching order yet." in captured
+    assert "https://www.amazon.com/cpe/yourpayments/transactions" in captured
+
+
+def test_process_transaction_links_transactions_page_when_unmatched(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The auto-skip says which page would have resolved the transaction."""
+    monkeypatch.setattr(cli_module, "_prompt_line", lambda _message: "s")
+
+    process_transaction(
+        _charge_txn("t1", -999990),
+        0,
+        1,
+        AmazonData.from_orders([_batch_order()]),
+        MemoGenerator("amazon.ca"),
+        Mock(),
+        Mock(),
+        {},
+        {},
+        set(),
+        False,
+        {},
+    )
+
+    captured = capsys.readouterr().out
+    assert "No matching order found" in captured
+    assert "https://www.amazon.ca/cpe/yourpayments/transactions" in captured

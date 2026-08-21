@@ -35,6 +35,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - The paste loop ends once every transaction is covered instead of asking for
   another page, and says when covered orders still lack item prices so extra
   details pages remain an informed choice
+- Every prompt that reports missing information now links the page that would
+  supply it — the payments page for unmatched transactions, and each order's
+  details page for orders with no items
+
+### Fixed
+
+- Page links use the configured `AMAZON_DOMAIN` instead of a hardcoded
+  `amazon.com`, which was wrong for the default `amazon.ca` and every other
+  non-US storefront
 
 ### Changed
 

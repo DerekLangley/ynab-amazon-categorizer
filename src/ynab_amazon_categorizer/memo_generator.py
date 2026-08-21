@@ -3,6 +3,7 @@
 import re
 from typing import Any
 
+from .amazon_links import order_details_url
 from .models import Order
 
 # YNAB memo field maximum length (API rejects longer values)
@@ -106,9 +107,7 @@ class MemoGenerator:
 
     def generate_amazon_order_link(self, order_id: str | None) -> str | None:
         """Generate Amazon order details link"""
-        if order_id:
-            return f"https://www.{self.amazon_domain}/gp/your-account/order-details?ie=UTF8&orderID={order_id}"
-        return None
+        return order_details_url(self.amazon_domain, order_id)
 
     def generate_enhanced_memo(
         self,
