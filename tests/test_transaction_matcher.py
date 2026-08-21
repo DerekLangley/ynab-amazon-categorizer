@@ -2,7 +2,9 @@
 
 import pytest
 
+from ynab_amazon_categorizer.amazon_data import AmazonData
 from ynab_amazon_categorizer.amazon_parser import Order
+from ynab_amazon_categorizer.models import AmazonCharge
 from ynab_amazon_categorizer.transaction_matcher import TransactionMatcher
 
 
@@ -292,3 +294,199 @@ def test_find_confident_match_excludes_used() -> None:
         )
         is None
     )
+
+
+# --- charge matching (Amazon payments page) ---------------------------------
+
+
+def _make_charge(
+    amount: float,
+    order_id: str = "114-1234567-1234567",
+    date_str: str | None = "August 15, 2026",
+    is_refund: bool = False,
+) -> AmazonCharge:
+    """Helper to create AmazonCharge rows for tests."""
+    return AmazonCharge(
+        amount=amount,
+        date_str=date_str,
+        order_id=order_id,
+        payment_method="Prime Visa ****1234",
+        is_refund=is_refund,
+        currency="$",
+    )
+
+
+def test_find_matching_charge_matches_a_partial_shipment_charge() -> None:
+    """The core gap: a charge that is only part of the order's total."""
+    matcher = TransactionMatcher()
+    charges = [_make_charge(-115.22), _make_charge(-42.68)]
+
+    result = matcher.find_matching_charge(-115.22, "2026-08-16", charges)
+
+    assert result is not None
+    assert result.amount == -115.22
+
+
+def test_find_matching_charge_requires_matching_direction() -> None:
+    """An inflow must not match an outflow charge of the same magnitude."""
+    matcher = TransactionMatcher()
+
+    assert (
+        matcher.find_matching_charge(19.36, "2026-08-09", [_make_charge(-19.36)])
+        is None
+    )
+
+
+def test_find_matching_charge_matches_a_refund_to_an_inflow() -> None:
+    matcher = TransactionMatcher()
+    refund = _make_charge(
+        19.36, "114-3456789-3456789", "August 8, 2026", is_refund=True
+    )
+
+    result = matcher.find_matching_charge(19.36, "2026-08-09", [refund])
+
+    assert result is refund
+
+
+def test_find_matching_charge_respects_the_date_window() -> None:
+    matcher = TransactionMatcher()
+    charges = [_make_charge(-42.68, date_str="January 1, 2026")]
+
+    assert matcher.find_matching_charge(-42.68, "2026-08-16", charges) is None
+
+
+def test_find_matching_charge_skips_already_used_charges() -> None:
+    """Two same-amount charges feed two transactions, one each."""
+    matcher = TransactionMatcher()
+    first, second = (
+        _make_charge(-20.00, "114-1111111-1111111"),
+        _make_charge(-20.00, "114-2222222-2222222"),
+    )
+    charges = [first, second]
+
+    used: set[tuple[str, str, str]] = {first.key}
+    result = matcher.find_matching_charge(-20.00, "2026-08-16", charges, used)
+
+    assert result is second
+
+
+def test_find_matching_charge_ignores_rows_without_an_order() -> None:
+    matcher = TransactionMatcher()
+    orphan = _make_charge(-42.68)
+    orphan.order_id = None
+
+    assert matcher.find_matching_charge(-42.68, "2026-08-16", [orphan]) is None
+
+
+def test_find_confident_charge_rejects_two_candidates() -> None:
+    matcher = TransactionMatcher()
+    charges = [
+        _make_charge(-20.00, "114-1111111-1111111"),
+        _make_charge(-20.00, "114-2222222-2222222"),
+    ]
+
+    assert matcher.find_confident_charge(-20.00, "2026-08-16", charges) is None
+
+
+# --- combined resolution -----------------------------------------------------
+
+
+def test_resolve_order_prefers_a_charge_over_an_order_total() -> None:
+    """The charge names its order outright, so it beats an amount coincidence."""
+    matcher = TransactionMatcher()
+    coincidence = _make_order(order_id="702-9999999-9999999", total=42.68)
+    real = _make_order(order_id="114-1234567-1234567", total=157.90)
+    data = AmazonData(orders=[coincidence, real], charges=[_make_charge(-42.68)])
+
+    result = matcher.resolve_order(-42.68, "2026-08-16", data)
+
+    assert result is not None
+    assert result.order_id == "114-1234567-1234567"
+    assert result.matched_charge is not None
+    assert result.is_partial_charge
+
+
+def test_resolve_order_falls_back_to_order_totals() -> None:
+    matcher = TransactionMatcher()
+    order = _make_order(
+        order_id="114-9012345-9012345", total=16.34, date_str="August 5, 2026"
+    )
+    data = AmazonData(orders=[order], charges=[_make_charge(-42.68)])
+
+    result = matcher.resolve_order(-16.34, "2026-08-09", data)
+
+    assert result is not None
+    assert result.order_id == "114-9012345-9012345"
+    assert result.matched_charge is None
+
+
+def test_resolve_order_stubs_an_order_known_only_from_a_charge() -> None:
+    """A charge for an order we never saw still yields its ID and link."""
+    matcher = TransactionMatcher()
+    charge = _make_charge(-16.42, "114-4567890-4567890", "August 7, 2026")
+    data = AmazonData(charges=[charge])
+
+    result = matcher.resolve_order(-16.42, "2026-08-09", data)
+
+    assert result is not None
+    assert result.order_id == "114-4567890-4567890"
+    assert result.items == []
+    assert result.total is None
+    assert result.matched_charge is charge
+
+
+def test_resolve_order_does_not_mutate_the_stored_order() -> None:
+    """Per-transaction charge context must not leak into shared parsed data."""
+    matcher = TransactionMatcher()
+    order = _make_order(order_id="114-1234567-1234567", total=157.90)
+    data = AmazonData(orders=[order], charges=[_make_charge(-42.68)])
+
+    result = matcher.resolve_order(-42.68, "2026-08-16", data)
+
+    assert result is not None and result.matched_charge is not None
+    assert order.matched_charge is None
+
+
+def test_resolve_order_matches_both_charges_of_one_order() -> None:
+    """A two-shipment order fills two transactions, not one."""
+    matcher = TransactionMatcher()
+    order = _make_order(
+        order_id="114-1234567-1234567", total=157.90, date_str="August 13, 2026"
+    )
+    first, second = _make_charge(-115.22), _make_charge(-42.68)
+    data = AmazonData(orders=[order], charges=[first, second])
+    used_orders: set[str] = set()
+    used_charges: set[tuple[str, str, str]] = set()
+
+    one = matcher.resolve_order(-115.22, "2026-08-16", data, used_orders, used_charges)
+    assert one is not None and one.matched_charge is not None
+    used_charges.add(one.matched_charge.key)
+
+    two = matcher.resolve_order(-42.68, "2026-08-16", data, used_orders, used_charges)
+
+    assert two is not None and two.matched_charge is not None
+    assert two.matched_charge.amount == -42.68
+
+
+def test_is_partial_charge_is_false_for_a_whole_order_charge() -> None:
+    matcher = TransactionMatcher()
+    order = _make_order(order_id="114-9012345-9012345", total=16.34)
+    data = AmazonData(
+        orders=[order], charges=[_make_charge(-16.34, "114-9012345-9012345")]
+    )
+
+    result = matcher.resolve_order(-16.34, "2026-08-16", data)
+
+    assert result is not None
+    assert not result.is_partial_charge
+
+
+def test_resolve_confident_order_skips_an_ambiguous_charge() -> None:
+    matcher = TransactionMatcher()
+    charges = [
+        _make_charge(-20.00, "114-1111111-1111111"),
+        _make_charge(-20.00, "114-2222222-2222222"),
+    ]
+    data = AmazonData(charges=charges)
+
+    assert matcher.resolve_confident_order(-20.00, "2026-08-16", data) is None

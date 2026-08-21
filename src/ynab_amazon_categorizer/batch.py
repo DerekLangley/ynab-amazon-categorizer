@@ -6,9 +6,10 @@ from typing import Any
 
 import requests
 
+from .amazon_data import AmazonData
 from .exceptions import YNABAPIError
 from .memo_generator import MemoGenerator, build_batch_memo
-from .models import Order, format_currency_amount
+from .models import format_currency_amount
 from .payloads import build_memo_only_payload
 from .transaction_matcher import TransactionMatcher
 from .ynab_client import YNABClient
@@ -18,23 +19,26 @@ logger = logging.getLogger(__name__)
 
 def process_batch(
     transactions: Sequence[Mapping[str, Any]],
-    parsed_orders: list[Order] | None,
+    amazon_data: AmazonData | None,
     memo_generator: MemoGenerator,
     ynab_client: YNABClient,
     dry_run: bool = False,
 ) -> tuple[int, int, int]:
     """Auto-enrich confidently matched memos without changing categories."""
     matcher = TransactionMatcher()
+    data = amazon_data if amazon_data is not None else AmazonData()
     used_order_ids: set[str] = set()
+    used_charge_keys: set[tuple[str, str, str]] = set()
     enriched = skipped = failed = 0
 
     for transaction in transactions:
         amount_float = transaction["amount"] / 1000.0
-        order = matcher.find_confident_match(
+        order = matcher.resolve_confident_order(
             amount_float,
             transaction["date"],
-            parsed_orders or [],
+            data,
             used_order_ids,
+            used_charge_keys,
         )
         if order is None:
             skipped += 1
@@ -42,8 +46,12 @@ def process_batch(
 
         # A confident match belongs to this transaction even when enrichment is
         # unnecessary or impossible. Do not let a later same-amount transaction
-        # reuse the order merely because this transaction does not get updated.
-        if order.order_id:
+        # reuse it merely because this transaction does not get updated. A
+        # charge-based match retires only that charge row, since a
+        # multi-shipment order rightly matches several transactions.
+        if order.matched_charge is not None:
+            used_charge_keys.add(order.matched_charge.key)
+        elif order.order_id:
             used_order_ids.add(order.order_id)
 
         original_memo = transaction.get("memo")

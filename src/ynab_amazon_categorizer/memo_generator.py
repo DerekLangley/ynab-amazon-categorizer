@@ -43,14 +43,23 @@ def sanitize_memo(memo: str, max_length: int = YNAB_MEMO_MAX_LENGTH) -> str:
 
 
 def generate_split_summary_memo(order: Order) -> str:
-    """Generate a compact summary of every parsed item in an order."""
+    """Generate a compact summary of every parsed item in an order.
+
+    When the transaction is only one charge against a larger order (a
+    per-shipment bill, or a split payment), the items listed are the whole
+    order's rather than this charge's — Amazon does not say which items each
+    charge covered — so the summary says so instead of implying otherwise.
+    """
     items = order.items
     if not items:
         return ""
-    if len(items) == 1:
-        return sanitize_memo(items[0])
 
-    summary = f"{len(items)} Items:\n" + "\n".join(f"- {item}" for item in items)
+    partial = order.is_partial_charge
+    if len(items) == 1:
+        return sanitize_memo(f"Part of: {items[0]}" if partial else items[0])
+
+    header = f"{len(items)} Items" + (" (part of order)" if partial else "")
+    summary = f"{header}:\n" + "\n".join(f"- {item}" for item in items)
     return sanitize_memo(summary)
 
 

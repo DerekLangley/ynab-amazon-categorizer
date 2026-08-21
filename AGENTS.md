@@ -35,8 +35,9 @@ python -X utf8 src/ynab_amazon_categorizer/cli.py
 
 Current modules:
 - `src/ynab_amazon_categorizer/cli.py` - main CLI entry point and interactive flow.
-- `src/ynab_amazon_categorizer/amazon_parser.py` - Amazon order parsing logic.
-- `src/ynab_amazon_categorizer/transaction_matcher.py` - amount/date matching logic.
+- `src/ynab_amazon_categorizer/amazon_parser.py` - parsing for all three Amazon pages (orders list, order details, payments/transactions) plus page-type detection.
+- `src/ynab_amazon_categorizer/amazon_data.py` - `AmazonData` aggregate that merges orders/details/charges from however many pages were pasted.
+- `src/ynab_amazon_categorizer/transaction_matcher.py` - amount/date matching against order totals and against individual charges.
 - `src/ynab_amazon_categorizer/memo_generator.py` - memo and order-link generation.
 - `src/ynab_amazon_categorizer/ynab_client.py` - YNAB API communication.
 - `src/ynab_amazon_categorizer/config.py` - environment config loading/validation.
@@ -52,14 +53,33 @@ Design principles:
 - Add tests for behavior changes before refactoring or extending logic.
 
 Data flow:
-1. User copies Amazon orders page text.
-2. Parser extracts orders and item details.
+1. User pastes any of three Amazon pages, in any order: the orders list, an
+   order details page, and/or the payments/transactions page.
+2. `detect_page_kind` routes each paste to its parser; `AmazonData` merges the
+   results, with order-details data winning over the orders list.
 3. Tool fetches uncategorized YNAB transactions.
-4. Matcher pairs orders with transactions using amount/date heuristics.
+4. Matcher resolves each transaction to an order, charges first.
 5. CLI guides category updates and split transactions.
 6. Tool updates YNAB memos/categories via API.
 
+Why three pages:
+- The orders list has order *totals*; YNAB records what hit the *card*. They
+  differ whenever an order ships in several packages, is partly paid by gift
+  card or reward points, or is refunded — which is why amount-only matching
+  against order totals leaves those transactions unmatched.
+- The payments/transactions page states the order ID for each charge outright,
+  so it resolves exactly those cases.
+- The order details page carries the full item list with per-unit prices and
+  the tax breakdown; the orders list paginates items inside each order card and
+  never shows prices.
+
 Matching and memo behavior:
+- A charge match names its order outright, so it is preferred over an
+  amount match against order totals; order totals remain the fallback.
+- `used_order_ids` and `used_charge_keys` are tracked separately: one order
+  legitimately produces several charges, hence several transactions.
+- A charge covering only part of its order is flagged as partial in display and
+  memo text, since Amazon does not say which items that shipment covered.
 - Transaction matching prioritizes amount match with date proximity heuristics.
 - Memo generation should include item context and an order link when available.
 - Missing/partial order data should degrade gracefully rather than crash updates.
@@ -93,3 +113,6 @@ YNAB_ACCOUNT_ID=none
 - On Windows, prefer `python -X utf8` to avoid emoji/category encoding issues.
 - Focus processing on likely Amazon payees (`amazon`, `amzn`, `amz`).
 - Add or update tests when behavior changes (parser, matcher, memo generation, API payloads).
+- Never commit real Amazon page copies or fixtures built from them: they carry names,
+  addresses, card last-4 digits, and real order IDs. Test fixtures must use synthetic
+  names and order IDs (see `tests/test_amazon_pages.py`).

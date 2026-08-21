@@ -7,9 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Amazon **payments/transactions page** support: pasting
+  `amazon.com/cpe/yourpayments/transactions` maps each card charge to its order
+  ID, which resolves transactions the orders page alone cannot match — an order
+  billed once per shipment, one split across a gift card or reward points, and
+  refunds
+- Amazon **order details page** support: the complete item list with per-unit
+  prices, quantities, and the order's subtotal/tax, filling in items the orders
+  list page truncates behind its in-card pagination
+- One paste prompt now accepts any of the three pages, in any order, as many
+  times as you like — the page type is detected automatically and repeat
+  sightings of an order are merged, with details-page data winning
+- When a charge names an order none of the pasted pages described, the tool
+  offers to take that order's details page right then
+- Matched-order display shows the specific charge (amount, date, payment
+  method), per-item prices, and order tax
+- Split entry accepts `i` to use the matched item's price from the order
+  details page as the base amount
+- Batch mode enriches charge-matched transactions too, including both
+  transactions of a two-shipment order
+
 ### Changed
 
-- Transactions are fetched before the Amazon order-data prompt, and the tool exits immediately when there is nothing to process — no more pasting order data against zero transactions
+- Transactions are fetched before the Amazon data prompt, and the tool exits
+  immediately when there is nothing to process — no more pasting pages against
+  zero transactions
+- A charge that covers only part of its order is flagged in the display and in
+  generated memos ("part of order"), since Amazon does not say which items a
+  given shipment charge covered
+- Item lists keep every distinct line item rather than spending the per-order
+  cap on repeated units of one product
+
+### Security
+
+- `.gitignore` now excludes saved Amazon page copies (`Local-Data/`,
+  `orders.txt`, `order-details.txt`, `transactions.txt`, `*.amazon.txt`), which
+  contain names, addresses, card last-4 digits, and real order IDs
 
 ## [2.4.2] - 2026-07-10
 

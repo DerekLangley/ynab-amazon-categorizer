@@ -3,6 +3,17 @@
 ynab_config.txt
 api_key.txt
 
+# Saved Amazon page copies - NEVER COMMIT THESE!
+# Real orders, order-details, and payments pages carry names, addresses,
+# card last-4 digits, and order IDs. Keep sample dumps out of the repo; test
+# fixtures must use synthetic names and order IDs instead.
+Local-Data/
+local-data/
+orders.txt
+order-details.txt
+transactions.txt
+*.amazon.txt
+
 # Python
 __pycache__/
 *.py[cod]

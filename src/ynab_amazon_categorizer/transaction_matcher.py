@@ -1,9 +1,12 @@
 """Transaction matching functionality."""
 
 from collections.abc import Sequence
+from dataclasses import replace
 from datetime import datetime
 
+from .amazon_data import AmazonData
 from .amazon_parser import Order
+from .models import AmazonCharge
 
 
 def _parse_transaction_date(date_str: str) -> datetime | None:
@@ -158,3 +161,178 @@ class TransactionMatcher:
                 if abs((trans_date - order_date).days) > max_date_diff_days:
                     return None
         return order
+
+    # --- Charge-level matching (Amazon payments/transactions page) --------
+
+    def find_matching_charge(
+        self,
+        transaction_amount: float,
+        transaction_date: str,
+        charges: Sequence[AmazonCharge],
+        used_charge_keys: set[tuple[str, str, str]] | None = None,
+        max_date_diff_days: int = 14,
+    ) -> AmazonCharge | None:
+        """Find the charge row that produced this YNAB transaction.
+
+        Charges are what actually hit the card, so this matches transactions an
+        order total never can: one order billed once per shipment, an order
+        partly paid by gift card or points, or a refund. Direction must agree
+        (an inflow only matches a refund) on top of the same exact-amount and
+        date-proximity rules used for orders.
+
+        ``used_charge_keys`` tracks charges already consumed. It is keyed by
+        charge rather than by order because one order legitimately produces
+        several transactions.
+        """
+        candidates = self._charge_candidates(
+            transaction_amount,
+            transaction_date,
+            charges,
+            used_charge_keys,
+            max_date_diff_days,
+        )
+        if not candidates:
+            return None
+        # Closest date first, then a stable key so repeated runs agree.
+        candidates.sort(
+            key=lambda pair: (
+                pair[1] if pair[1] is not None else max_date_diff_days + 1,
+                pair[0].order_id or "",
+            )
+        )
+        return candidates[0][0]
+
+    def find_confident_charge(
+        self,
+        transaction_amount: float,
+        transaction_date: str,
+        charges: Sequence[AmazonCharge],
+        used_charge_keys: set[tuple[str, str, str]] | None = None,
+        max_date_diff_days: int = 7,
+    ) -> AmazonCharge | None:
+        """Return a charge only when exactly one is plausible (for batch use)."""
+        candidates = self._charge_candidates(
+            transaction_amount,
+            transaction_date,
+            charges,
+            used_charge_keys,
+            max_date_diff_days,
+        )
+        if len(candidates) != 1:
+            return None
+        return candidates[0][0]
+
+    def _charge_candidates(
+        self,
+        transaction_amount: float,
+        transaction_date: str,
+        charges: Sequence[AmazonCharge],
+        used_charge_keys: set[tuple[str, str, str]] | None,
+        max_date_diff_days: int,
+    ) -> list[tuple[AmazonCharge, int | None]]:
+        """Charges matching this transaction, paired with their date distance."""
+        trans_date = _parse_transaction_date(transaction_date)
+        transaction_is_inflow = transaction_amount > 0
+        matches: list[tuple[AmazonCharge, int | None]] = []
+
+        for charge in charges:
+            if charge.amount is None or not charge.order_id:
+                continue
+            if used_charge_keys and charge.key in used_charge_keys:
+                continue
+            if (charge.amount > 0) != transaction_is_inflow:
+                continue
+            if abs(abs(charge.amount) - abs(transaction_amount)) >= 0.01:
+                continue
+
+            date_diff: int | None = None
+            if trans_date:
+                charge_date = _parse_order_date(charge.date_str)
+                if charge_date:
+                    date_diff = abs((trans_date - charge_date).days)
+                    if date_diff > max_date_diff_days:
+                        continue
+            matches.append((charge, date_diff))
+
+        return matches
+
+    # --- Combined resolution ---------------------------------------------
+
+    def resolve_order(
+        self,
+        transaction_amount: float,
+        transaction_date: str,
+        amazon_data: AmazonData,
+        used_order_ids: set[str] | None = None,
+        used_charge_keys: set[tuple[str, str, str]] | None = None,
+    ) -> Order | None:
+        """Best available order context for a transaction, charges first.
+
+        A charge match names its order outright, so it is trusted over an
+        amount match against order totals. When the named order was never
+        parsed, a stub carrying just the ID is returned: the order link and the
+        charge details are still worth showing, and the CLI can offer to take
+        that order's details page.
+
+        The returned order is a copy with ``matched_charge`` set, so the caller
+        can tell a whole-order match from one shipment of a larger order
+        without mutating the shared parsed data.
+        """
+        charge = self.find_matching_charge(
+            transaction_amount,
+            transaction_date,
+            amazon_data.charges,
+            used_charge_keys,
+        )
+        if charge is not None:
+            return _order_for_charge(charge, amazon_data)
+
+        return self.find_matching_order(
+            transaction_amount,
+            transaction_date,
+            amazon_data.orders,
+            used_order_ids,
+        )
+
+    def resolve_confident_order(
+        self,
+        transaction_amount: float,
+        transaction_date: str,
+        amazon_data: AmazonData,
+        used_order_ids: set[str] | None = None,
+        used_charge_keys: set[tuple[str, str, str]] | None = None,
+    ) -> Order | None:
+        """Unambiguous order context for batch mode, charges first.
+
+        A charge naming an order we have no item data for is not enough to
+        enrich a memo beyond the order link, but the link alone is still a real
+        improvement, so it is returned like any other match.
+        """
+        charge = self.find_confident_charge(
+            transaction_amount,
+            transaction_date,
+            amazon_data.charges,
+            used_charge_keys,
+        )
+        if charge is not None:
+            return _order_for_charge(charge, amazon_data)
+
+        return self.find_confident_match(
+            transaction_amount,
+            transaction_date,
+            amazon_data.orders,
+            used_order_ids,
+        )
+
+
+def _order_for_charge(charge: AmazonCharge, amazon_data: AmazonData) -> Order:
+    """Attach a matched charge to its order, stubbing one in when unknown."""
+    order = amazon_data.order_by_id(charge.order_id)
+    if order is None:
+        return Order(
+            order_id=charge.order_id,
+            date_str=charge.date_str,
+            currency=charge.currency,
+            matched_charge=charge,
+        )
+    return replace(order, matched_charge=charge)

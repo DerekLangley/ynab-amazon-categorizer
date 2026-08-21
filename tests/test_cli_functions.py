@@ -5,13 +5,15 @@ from unittest.mock import Mock
 import pytest
 
 import ynab_amazon_categorizer.cli as cli_module
-from ynab_amazon_categorizer.amazon_parser import Order
+from ynab_amazon_categorizer.amazon_data import AmazonData
+from ynab_amazon_categorizer.amazon_parser import AmazonParser, Order
 from ynab_amazon_categorizer.batch import process_batch
 from ynab_amazon_categorizer.cli import (
     _env_flag,
     _handle_categorize,
     _parse_args,
     _tax_rate_for_category,
+    absorb_amazon_page,
     build_preview,
     compute_split_amount,
     display_matched_order,
@@ -29,12 +31,18 @@ from ynab_amazon_categorizer.memo_generator import (
     build_batch_memo,
     generate_split_summary_memo,
 )
-from ynab_amazon_categorizer.models import SaveSubtransaction
+from ynab_amazon_categorizer.models import (
+    AmazonCharge,
+    OrderItem,
+    SaveSubtransaction,
+    expand_items,
+)
 from ynab_amazon_categorizer.payloads import (
     build_memo_only_payload,
     build_single_payload,
     build_split_payload,
 )
+from ynab_amazon_categorizer.transaction_matcher import TransactionMatcher
 from ynab_amazon_categorizer.transactions import (
     fetch_amazon_transactions,
     is_amazon_payee,
@@ -386,23 +394,25 @@ def test_prompt_for_orders_displays_parsed_currency_end_to_end(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """The parser's currency survives through the first CLI order summary."""
-    monkeypatch.setattr(
-        cli_module,
-        "get_multiline_input_with_custom_submit",
-        lambda _prompt: (
-            """
+    pages = [
+        """
         Order placed January 15, 2025
         Total £14.99
         Order # 702-1234567-7654321
         International Product Name With Enough Words To Parse
-        """
-        ),
+        """,
+        "",  # an empty submit ends the paste loop
+    ]
+    monkeypatch.setattr(
+        cli_module,
+        "get_multiline_input_with_custom_submit",
+        lambda _prompt: pages.pop(0),
     )
 
-    orders = cli_module.prompt_for_amazon_orders_data()
+    amazon_data = cli_module.prompt_for_amazon_data()
 
-    assert orders is not None
-    assert orders[0].currency == "£"
+    assert amazon_data.orders
+    assert amazon_data.orders[0].currency == "£"
     captured = capsys.readouterr().out
     assert "Order 702-1234567-7654321: £14.99" in captured
     assert "Order 702-1234567-7654321: $14.99" not in captured
@@ -470,7 +480,7 @@ def test_process_transaction_uses_matched_order_currency_for_inflow(
         transaction,
         0,
         1,
-        [order],
+        AmazonData.from_orders([order]),
         MemoGenerator(),
         Mock(),
         Mock(),
@@ -694,7 +704,7 @@ def test_process_transaction_marks_order_used(
         transaction,
         0,
         1,
-        [_amount_matched_order()],
+        AmazonData.from_orders([_amount_matched_order()]),
         MemoGenerator(),
         Mock(),
         Mock(),
@@ -729,7 +739,7 @@ def test_process_transaction_dry_run_does_not_mark_used(
         transaction,
         0,
         1,
-        [_amount_matched_order()],
+        AmazonData.from_orders([_amount_matched_order()]),
         MemoGenerator(),
         Mock(),
         Mock(),
@@ -826,7 +836,7 @@ def test_process_batch_enriches_confident_match() -> None:
     client = Mock()
     enriched, skipped, failed = process_batch(
         [_batch_txn("t1", -20000)],
-        [_batch_order()],
+        AmazonData.from_orders([_batch_order()]),
         MemoGenerator("amazon.com"),
         client,
     )
@@ -848,7 +858,7 @@ def test_process_batch_displays_matched_order_currency(
 
     result = process_batch(
         [_batch_txn("t1", -20000)],
-        [order],
+        AmazonData.from_orders([order]),
         MemoGenerator(),
         Mock(),
         dry_run=True,
@@ -865,7 +875,10 @@ def test_process_batch_skips_ambiguous() -> None:
     client = Mock()
     orders = [_batch_order("702-AAAAAAA-0000000"), _batch_order("702-BBBBBBB-0000000")]
     enriched, skipped, failed = process_batch(
-        [_batch_txn("t1", -20000)], orders, MemoGenerator(), client
+        [_batch_txn("t1", -20000)],
+        AmazonData.from_orders(orders),
+        MemoGenerator(),
+        client,
     )
 
     assert (enriched, skipped, failed) == (0, 1, 0)
@@ -876,7 +889,11 @@ def test_process_batch_dry_run_no_api_call() -> None:
     """Dry-run counts the enrichment but sends nothing to YNAB."""
     client = Mock()
     enriched, skipped, failed = process_batch(
-        [_batch_txn("t1", -20000)], [_batch_order()], MemoGenerator(), client, True
+        [_batch_txn("t1", -20000)],
+        AmazonData.from_orders([_batch_order()]),
+        MemoGenerator(),
+        client,
+        True,
     )
 
     assert enriched == 1
@@ -890,7 +907,10 @@ def test_process_batch_counts_failure() -> None:
     client = Mock()
     client.update_transaction.side_effect = YNABAPIError("boom", status_code=500)
     enriched, skipped, failed = process_batch(
-        [_batch_txn("t1", -20000)], [_batch_order()], MemoGenerator(), client
+        [_batch_txn("t1", -20000)],
+        AmazonData.from_orders([_batch_order()]),
+        MemoGenerator(),
+        client,
     )
 
     assert (enriched, skipped, failed) == (0, 0, 1)
@@ -1276,7 +1296,7 @@ def test_process_transaction_auto_skips_unmatched_when_orders_provided(
         transaction,
         0,
         1,
-        [_amount_matched_order()],
+        AmazonData.from_orders([_amount_matched_order()]),
         MemoGenerator(),
         Mock(),
         Mock(),
@@ -1324,7 +1344,12 @@ def test_process_batch_preserves_existing_memo() -> None:
     transaction = _batch_txn("t1", -20000)
     transaction["memo"] = "Imported reference 123"
 
-    result = process_batch([transaction], [_batch_order()], MemoGenerator(), client)
+    result = process_batch(
+        [transaction],
+        AmazonData.from_orders([_batch_order()]),
+        MemoGenerator(),
+        client,
+    )
 
     assert result == (1, 0, 0)
     payload = client.update_transaction.call_args.args[1]
@@ -1342,7 +1367,7 @@ def test_process_batch_skips_already_enriched_memo_and_consumes_order() -> None:
 
     result = process_batch(
         [transaction, _batch_txn("t2", -20000)],
-        [order],
+        AmazonData.from_orders([order]),
         MemoGenerator(),
         client,
     )
@@ -1357,7 +1382,12 @@ def test_process_batch_skips_when_existing_memo_cannot_be_preserved() -> None:
     transaction = _batch_txn("t1", -20000)
     transaction["memo"] = "X" * 195
 
-    result = process_batch([transaction], [_batch_order()], MemoGenerator(), client)
+    result = process_batch(
+        [transaction],
+        AmazonData.from_orders([_batch_order()]),
+        MemoGenerator(),
+        client,
+    )
 
     assert result == (0, 1, 0)
     client.update_transaction.assert_not_called()
@@ -1371,7 +1401,7 @@ def test_process_batch_oversized_memo_consumes_matched_order() -> None:
 
     result = process_batch(
         [transaction, _batch_txn("t2", -20000)],
-        [_batch_order()],
+        AmazonData.from_orders([_batch_order()]),
         MemoGenerator(),
         client,
     )
@@ -1397,7 +1427,9 @@ def test_main_batch_dry_run_smoke(
     monkeypatch.setattr(cli_module, "YNABClient", lambda *_args: client)
     monkeypatch.setattr(cli_module, "_prompt_line", lambda _message: "y")
     monkeypatch.setattr(
-        cli_module, "prompt_for_amazon_orders_data", lambda: [_batch_order()]
+        cli_module,
+        "prompt_for_amazon_data",
+        lambda: AmazonData.from_orders([_batch_order()]),
     )
     monkeypatch.setattr(
         cli_module,
@@ -1478,3 +1510,358 @@ def test_main_handles_terminal_interruption(
 
     assert exit_code == 130
     assert "Operation cancelled" in capsys.readouterr().out
+
+
+# --- charge-aware matching through the CLI ---------------------------------
+
+
+def _charge_txn(
+    txn_id: str = "t1", amount: int = -115220, date: str = "2026-08-16"
+) -> dict:
+    return {
+        "id": txn_id,
+        "account_id": "a1",
+        "date": date,
+        "amount": amount,
+        "payee_name": "Amazon",
+        "category_id": None,
+        "approved": False,
+        "memo": "",
+    }
+
+
+def _shipment_data() -> AmazonData:
+    """One $157.90 order billed as two separate card charges."""
+    detailed_items = [
+        OrderItem("Caribou Coffee K-Cup Pods", 19.99),
+        OrderItem("Large Ceramic Coffee Mug Set", 22.69),
+    ]
+    items, item_prices = expand_items(detailed_items, 10)
+    order = Order(
+        order_id="114-1234567-1234567",
+        total=157.90,
+        date_str="August 13, 2026",
+        items=items,
+        currency="$",
+        detailed_items=detailed_items,
+        tax=11.52,
+        item_prices=item_prices,
+    )
+    charges = [
+        AmazonCharge(
+            amount=-115.22,
+            date_str="August 15, 2026",
+            order_id="114-1234567-1234567",
+            payment_method="Prime Visa ****1234",
+            currency="$",
+        ),
+        AmazonCharge(
+            amount=-42.68,
+            date_str="August 15, 2026",
+            order_id="114-1234567-1234567",
+            payment_method="Prime Visa ****1234",
+            currency="$",
+        ),
+    ]
+    return AmazonData(orders=[order], charges=charges)
+
+
+def test_display_matched_order_flags_a_partial_charge(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A per-shipment charge must not read as if it covered the whole order."""
+    matcher = TransactionMatcher()
+    order = matcher.resolve_order(-115.22, "2026-08-16", _shipment_data())
+
+    assert order is not None
+    display_matched_order(order, MemoGenerator("amazon.com"))
+
+    captured = capsys.readouterr().out
+    assert "Charge: -$115.22" in captured
+    assert "Prime Visa ****1234" in captured
+    assert "covers PART of the order" in captured
+    assert "Total: $157.90" in captured
+
+
+def test_display_matched_order_shows_item_prices(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    order = _shipment_data().orders[0]
+
+    display_matched_order(order, MemoGenerator("amazon.com"))
+
+    captured = capsys.readouterr().out
+    assert "Caribou Coffee K-Cup Pods — $19.99" in captured
+    assert "Order tax: $11.52" in captured
+
+
+def test_display_matched_order_labels_a_refund(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    order = Order(
+        order_id="114-3456789-3456789",
+        currency="$",
+        matched_charge=AmazonCharge(
+            amount=19.36,
+            date_str="August 8, 2026",
+            order_id="114-3456789-3456789",
+            is_refund=True,
+            currency="$",
+        ),
+    )
+
+    display_matched_order(order, MemoGenerator("amazon.com"))
+
+    captured = capsys.readouterr().out
+    assert "Refund: $19.36" in captured
+    assert "Items: none parsed" in captured
+
+
+def test_process_transaction_matches_a_charge_the_orders_page_cannot(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The regression this feature exists for: -115.22 vs a $157.90 order."""
+    monkeypatch.setattr(cli_module, "_prompt_line", lambda _message: "s")
+    stats: dict[str, int] = {}
+
+    result = process_transaction(
+        _charge_txn(),
+        0,
+        1,
+        _shipment_data(),
+        MemoGenerator("amazon.com"),
+        Mock(),
+        Mock(),
+        {},
+        {},
+        set(),
+        False,
+        stats,
+    )
+
+    captured = capsys.readouterr().out
+    assert result is True
+    assert "MATCHED ORDER FOUND" in captured
+    assert "114-1234567-1234567" in captured
+    assert stats.get("auto_skipped_no_match", 0) == 0
+
+
+def test_mark_match_used_retires_the_charge_not_the_order() -> None:
+    """Retiring the order would strand the order's other shipment charge."""
+    matcher = TransactionMatcher()
+    data = _shipment_data()
+    used_orders: set[str] = set()
+    used_charges: set[tuple[str, str, str]] = set()
+
+    first = matcher.resolve_order(
+        -115.22, "2026-08-16", data, used_orders, used_charges
+    )
+    assert first is not None
+    cli_module._mark_match_used(first, used_orders, used_charges)
+
+    assert used_orders == set()
+    assert len(used_charges) == 1
+
+    second = matcher.resolve_order(
+        -42.68, "2026-08-16", data, used_orders, used_charges
+    )
+    assert second is not None
+    assert second.matched_charge is not None
+    assert second.matched_charge.amount == -42.68
+
+
+def test_mark_match_used_retires_the_order_for_a_total_match() -> None:
+    used_orders: set[str] = set()
+    used_charges: set[tuple[str, str, str]] = set()
+
+    cli_module._mark_match_used(_batch_order(), used_orders, used_charges)
+
+    assert used_orders == {"702-1234567-7654321"}
+    assert used_charges == set()
+
+
+def test_process_batch_enriches_a_partial_shipment_charge() -> None:
+    """Batch mode picks up the charge-only matches too."""
+    client = Mock()
+
+    enriched, skipped, failed = process_batch(
+        [_charge_txn()],
+        _shipment_data(),
+        MemoGenerator("amazon.com"),
+        client,
+    )
+
+    assert (enriched, skipped, failed) == (1, 0, 0)
+    _txn_id, payload = client.update_transaction.call_args[0]
+    assert "114-1234567-1234567" in payload["memo"]
+    assert "part of order" in payload["memo"]
+
+
+def test_process_batch_enriches_both_charges_of_one_order() -> None:
+    """Both transactions of a two-shipment order get enriched, not just one."""
+    client = Mock()
+
+    enriched, skipped, failed = process_batch(
+        [_charge_txn("t1", -115220), _charge_txn("t2", -42680)],
+        _shipment_data(),
+        MemoGenerator("amazon.com"),
+        client,
+    )
+
+    assert (enriched, skipped, failed) == (2, 0, 0)
+    assert client.update_transaction.call_count == 2
+
+
+def test_process_batch_enriches_a_charge_for_an_unknown_order() -> None:
+    """An order link alone is still worth writing when no page described it."""
+    client = Mock()
+    data = AmazonData(
+        charges=[
+            AmazonCharge(
+                amount=-16.42,
+                date_str="August 7, 2026",
+                order_id="114-4567890-4567890",
+                currency="$",
+            )
+        ]
+    )
+
+    enriched, _skipped, _failed = process_batch(
+        [_charge_txn("t1", -16420, "2026-08-09")],
+        data,
+        MemoGenerator("amazon.com"),
+        client,
+    )
+
+    assert enriched == 1
+    _txn_id, payload = client.update_transaction.call_args[0]
+    assert "114-4567890-4567890" in payload["memo"]
+
+
+def test_prompt_for_order_details_fills_in_a_missing_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pasting one details page turns a bare order ID into a real item list."""
+    data = AmazonData(
+        charges=[
+            AmazonCharge(
+                amount=-16.42,
+                date_str="August 7, 2026",
+                order_id="114-4567890-4567890",
+                currency="$",
+            )
+        ]
+    )
+    details = """
+Order placed August 7, 2026  Order # 114-4567890-4567890
+Order Summary
+Grand Total:
+$16.42
+A Perfectly Ordinary Product Name Here
+A Perfectly Ordinary Product Name Here
+Sold by: Amazon.com
+$15.19
+"""
+    monkeypatch.setattr(cli_module, "_prompt_line", lambda _message: "y")
+    monkeypatch.setattr(
+        cli_module, "get_multiline_input_with_custom_submit", lambda _prompt: details
+    )
+
+    order = cli_module.prompt_for_order_details(
+        data, "114-4567890-4567890", MemoGenerator("amazon.com")
+    )
+
+    assert order is not None
+    assert order.items == ["A Perfectly Ordinary Product Name Here"]
+    assert data.unknown_charge_order_ids() == []
+
+
+def test_prompt_for_order_details_declined_leaves_data_untouched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = AmazonData(charges=[AmazonCharge(amount=-16.42, order_id="114-0-0")])
+    monkeypatch.setattr(cli_module, "_prompt_line", lambda _message: "n")
+
+    assert cli_module.prompt_for_order_details(data, "114-0-0", MemoGenerator()) is None
+    assert data.orders == []
+
+
+def test_prompt_for_order_details_rejects_a_page_for_another_order(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Pasting the wrong order's page must not be silently attached."""
+    data = AmazonData()
+    other = """
+Order placed August 7, 2026  Order # 114-9999999-9999999
+Order Summary
+Grand Total:
+$16.42
+A Perfectly Ordinary Product Name Here
+A Perfectly Ordinary Product Name Here
+Sold by: Amazon.com
+$15.19
+"""
+    monkeypatch.setattr(cli_module, "_prompt_line", lambda _message: "y")
+    monkeypatch.setattr(
+        cli_module, "get_multiline_input_with_custom_submit", lambda _prompt: other
+    )
+
+    result = cli_module.prompt_for_order_details(
+        data, "114-4567890-4567890", MemoGenerator("amazon.com")
+    )
+
+    assert result is None
+    assert "not 114-4567890-4567890" in capsys.readouterr().out
+
+
+def test_absorb_amazon_page_routes_each_page_kind() -> None:
+    data = AmazonData()
+    parser = AmazonParser()
+
+    assert (
+        absorb_amazon_page(
+            data,
+            """
+ORDER PLACED
+August 13, 2026
+TOTAL
+$5.18
+ORDER # 114-8901234-8901234
+ Amazon Basics Low-Odor Dry Erase Whiteboard Markers, 4-Pack
+""",
+            parser,
+        )
+        == "orders"
+    )
+    assert (
+        absorb_amazon_page(
+            data,
+            """
+August 15, 2026
+Prime Visa ****1234-$5.18
+Order #114-8901234-8901234
+AMZN Mktp US
+Prime Visa ****1234-$42.68
+Order #114-1234567-1234567
+AMZN Mktp US
+""",
+            parser,
+        )
+        == "transactions"
+    )
+    assert absorb_amazon_page(data, "unrelated notes", parser) == "unknown"
+
+    assert len(data.orders) == 1
+    assert len(data.charges) == 2
+
+
+def test_generate_split_summary_memo_marks_a_partial_charge() -> None:
+    matcher = TransactionMatcher()
+    order = matcher.resolve_order(-115.22, "2026-08-16", _shipment_data())
+
+    assert order is not None
+    assert "part of order" in generate_split_summary_memo(order)
+
+
+def test_generate_split_summary_memo_unmarked_for_a_whole_order() -> None:
+    assert "part of" not in generate_split_summary_memo(_shipment_data().orders[0])

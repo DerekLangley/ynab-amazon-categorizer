@@ -1,5 +1,6 @@
 import argparse
 import copy
+import dataclasses
 import json
 import logging
 import os
@@ -14,7 +15,8 @@ from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings, KeyPressEvent
 
 from . import __version__
-from .amazon_parser import AmazonParser, Order
+from .amazon_data import AmazonData
+from .amazon_parser import AmazonParser, Order, PageKind, detect_page_kind
 from .batch import process_batch
 from .config import Config
 from .exceptions import ConfigurationError, YNABAPIError
@@ -48,42 +50,149 @@ def _env_flag(var_name: str, default: bool = False) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "y")
 
 
-def prompt_for_amazon_orders_data() -> list[Order] | None:
-    """Prompt user to paste Amazon orders page data"""
-    print("\n--- Amazon Orders Data Entry ---")
-    print("You can copy and paste the content from your Amazon orders page.")
-    print("This will help automatically extract order details and item information.")
+def _print_amazon_data_instructions() -> None:
+    """Explain which Amazon pages help and what each one contributes."""
+    print("\n--- Amazon Data Entry ---")
+    print("Paste any of these pages; the tool works out which is which.")
+    print("  1. Your Orders          - order totals and item names")
+    print("     https://www.amazon.com/your-orders/orders")
+    print("  2. Order details        - every item with its price, plus tax")
+    print("     (open an order and choose 'View order details')")
+    print("  3. Your Transactions    - which card charge paid for which order")
+    print("     https://www.amazon.com/cpe/yourpayments/transactions")
+    print(
+        "\nPage 3 is what resolves transactions the orders page alone cannot: an\n"
+        "order billed once per shipment, one split with a gift card or points,\n"
+        "or a refund. Page 2 fills in items the orders page truncates."
+    )
 
-    print("\nPaste Amazon orders page content:")
 
-    orders_text = get_multiline_input_with_custom_submit("Paste here: ")
+def absorb_amazon_page(
+    amazon_data: AmazonData, page_text: str, parser: AmazonParser
+) -> PageKind:
+    """Parse one pasted page into ``amazon_data`` and report what it was.
 
-    if orders_text is None or orders_text.strip().lower() == "skip":
-        print("Skipping Amazon orders data entry.")
-        return None
+    Returns the detected page kind so the caller can tell the user what landed
+    (and say something useful when nothing did).
+    """
+    kind = detect_page_kind(page_text)
 
-    if not orders_text.strip():
-        return None
-
-    # Use extracted Amazon parser
-    amazon_parser = AmazonParser()
-    parsed_orders = amazon_parser.parse_orders_page(orders_text)
-
-    # Show what was parsed
-    if parsed_orders:
-        print(f"\n✓ Successfully parsed {len(parsed_orders)} orders from Amazon data")
-        for order in parsed_orders[:3]:
-            print(
-                f"  - Order {order.order_id}: "
-                f"{format_currency_amount(order.total, order.currency)} on {order.date_str}"
-            )
-        if len(parsed_orders) > 3:
-            print(f"  ... and {len(parsed_orders) - 3} more orders")
+    if kind == "transactions":
+        added = amazon_data.add_charges(parser.parse_transactions_page(page_text))
+        print(f"✓ Transactions page: {added} new charge(s) linked to orders.")
+    elif kind == "details":
+        orders = parser.parse_order_details_page(page_text)
+        added, merged = amazon_data.add_orders(orders)
+        priced = sum(1 for order in orders if order.has_item_prices)
+        print(
+            f"✓ Order details: {len(orders)} order(s) "
+            f"({added} new, {merged} updated, {priced} with item prices)."
+        )
+    elif kind == "orders":
+        orders = parser.parse_orders_page(page_text)
+        added, merged = amazon_data.add_orders(orders)
+        print(f"✓ Orders page: {len(orders)} order(s) ({added} new, {merged} updated).")
     else:
-        print("\nNo orders could be parsed from the provided text.")
-        print("This might be due to formatting differences in the copied text.")
+        print(
+            "⚠ Could not tell which Amazon page that was, so nothing was read.\n"
+            "  Copy the whole page (Select All) from one of the three URLs above."
+        )
 
-    return parsed_orders
+    return kind
+
+
+def _print_amazon_data_summary(amazon_data: AmazonData) -> None:
+    """Summarize what was gathered and what is still missing."""
+    if not amazon_data:
+        print("\nNo Amazon data provided.")
+        return
+
+    print(
+        f"\n✓ Amazon data: {len(amazon_data.orders)} order(s), "
+        f"{len(amazon_data.charges)} charge(s)."
+    )
+    for order in amazon_data.orders[:3]:
+        print(
+            f"  - Order {order.order_id}: "
+            f"{format_currency_amount(order.total, order.currency)} on "
+            f"{order.date_str} ({len(order.items)} items)"
+        )
+    if len(amazon_data.orders) > 3:
+        print(f"  ... and {len(amazon_data.orders) - 3} more orders")
+
+    missing = amazon_data.unknown_charge_order_ids()
+    if missing:
+        print(
+            f"\n  {len(missing)} order(s) are named by a charge but have no item "
+            "data yet."
+        )
+        print(
+            "  Matching transactions will still get an order link, and you can "
+            "paste\n  those order details pages when they come up."
+        )
+
+
+def prompt_for_amazon_data() -> AmazonData:
+    """Collect any number of Amazon pages, in any order, into one dataset."""
+    _print_amazon_data_instructions()
+
+    parser = AmazonParser()
+    amazon_data = AmazonData()
+    page_number = 1
+
+    while True:
+        print(f"\nPaste page {page_number} (or submit empty / 'done' to continue):")
+        page_text = get_multiline_input_with_custom_submit("Paste here: ")
+
+        if page_text is None or page_text.strip().lower() in ("", "done", "skip"):
+            break
+
+        absorb_amazon_page(amazon_data, page_text, parser)
+        page_number += 1
+
+    _print_amazon_data_summary(amazon_data)
+    return amazon_data
+
+
+def prompt_for_order_details(
+    amazon_data: AmazonData, order_id: str, memo_generator: MemoGenerator
+) -> Order | None:
+    """Offer to take the details page for an order we only know by ID.
+
+    Reached when a charge identifies the order behind a transaction but no
+    pasted page described it. Pasting that one page turns "some Amazon order"
+    into a real item list, which is the whole point of categorizing.
+    """
+    order_link = memo_generator.generate_amazon_order_link(order_id)
+    print(f"  This charge belongs to order {order_id}, but no item data was provided.")
+    if order_link:
+        print(f"  Details page: {order_link}")
+
+    answer = _prompt_line("Paste that order's details page now? (y/n, default n): ")
+    if answer.strip().lower() != "y":
+        return None
+
+    print("Paste the order details page:")
+    page_text = get_multiline_input_with_custom_submit("Paste here: ")
+    if not page_text or not page_text.strip():
+        print("  Nothing pasted.")
+        return None
+
+    parser = AmazonParser()
+    orders = parser.parse_order_details_page(page_text)
+    if not orders:
+        print("  No order details could be read from that text.")
+        return None
+
+    amazon_data.add_orders(orders)
+    resolved = amazon_data.order_by_id(order_id)
+    if resolved is None:
+        parsed_ids = ", ".join(order.order_id or "?" for order in orders)
+        print(f"  That page was for {parsed_ids}, not {order_id}.")
+        return None
+
+    print(f"  ✓ Loaded {len(resolved.items)} item(s) for {order_id}.")
+    return resolved
 
 
 def get_multiline_input_with_custom_submit(
@@ -321,6 +430,7 @@ def prompt_for_category_selection(
 
 def display_matched_order(matching_order: Order, memo_generator: MemoGenerator) -> None:
     """Display matched order details to the user."""
+    charge = matching_order.matched_charge
     print("\n  🎯 MATCHED ORDER FOUND:")
     print(f"     Order ID: {matching_order.order_id}")
     print(
@@ -330,12 +440,40 @@ def display_matched_order(matching_order: Order, memo_generator: MemoGenerator) 
     print(
         f"     Date: {matching_order.date_str if matching_order.date_str is not None else 'N/A'}"
     )
+    if charge is not None:
+        payment = f" via {charge.payment_method}" if charge.payment_method else ""
+        label = "Refund" if charge.is_refund else "Charge"
+        print(
+            f"     {label}: "
+            f"{format_currency_amount(charge.amount, charge.currency)}"
+            f" on {charge.date_str or 'N/A'}{payment}"
+        )
+        if matching_order.is_partial_charge:
+            # The order is billed per shipment (or partly paid another way), so
+            # this transaction covers only some of the items listed below.
+            print(
+                "     ⚠ This charge covers PART of the order — "
+                "the items below are the whole order."
+            )
     order_link = memo_generator.generate_amazon_order_link(matching_order.order_id)
     print(f"     Order Link: {order_link}")
+    if matching_order.tax is not None:
+        print(
+            f"     Order tax: "
+            f"{format_currency_amount(matching_order.tax, matching_order.currency)}"
+        )
     if matching_order.items:
         print("     Items:")
-        for item in matching_order.items:
-            print(f"       - {item}")
+        for index, item in enumerate(matching_order.items):
+            price = matching_order.item_price(index)
+            price_text = (
+                f" — {format_currency_amount(price, matching_order.currency)}"
+                if price is not None
+                else ""
+            )
+            print(f"       - {item}{price_text}")
+    else:
+        print("     Items: none parsed for this order")
     print()
 
 
@@ -441,10 +579,17 @@ def handle_split(
 
         # Show which item this split is for if we have matched order data
         items: list[str] = matching_order.items if matching_order else []
+        item_price: float | None = None
 
         if items:
             if split_count <= len(items):
-                print(f"Item {split_count}: {items[split_count - 1]}")
+                item_price = (
+                    matching_order.item_price(split_count - 1)
+                    if matching_order
+                    else None
+                )
+                price_text = f"  ({item_price:.2f})" if item_price is not None else ""
+                print(f"Item {split_count}: {items[split_count - 1]}{price_text}")
             else:
                 print("Additional split for remaining items")
 
@@ -460,17 +605,27 @@ def handle_split(
         # let the tool add sales tax automatically (rate chosen by category
         # via _tax_rate_for_category). Blank uses the full remaining balance
         # as-is (e.g. for a final catch-all split); '=' prefix enters an
-        # exact charged total with no tax math applied.
+        # exact charged total with no tax math applied; 'i' uses the item's
+        # price from the order details page, when one was provided.
         tax_rate = _tax_rate_for_category(category_name)
         tax_pct = tax_rate * 100
         while True:
             try:
                 max_amount = abs(remaining_milliunits / 1000.0)
                 max_base = max_amount / (1 + tax_rate) if tax_rate else max_amount
+                item_hint = (
+                    f", 'i' = item price {item_price:.2f}"
+                    if item_price is not None
+                    else ""
+                )
                 base_str = _prompt_line(
                     f"Enter base price for '{category_name}' ({tax_pct:g}% tax, "
-                    f"max base ~{max_base:.2f}, blank = remaining {max_amount:.2f} as-is): "
+                    f"max base ~{max_base:.2f}, blank = remaining "
+                    f"{max_amount:.2f} as-is{item_hint}): "
                 ).strip()
+
+                if base_str.lower() == "i" and item_price is not None:
+                    base_str = f"{item_price:.2f}"
 
                 if not base_str:
                     split_amount_float = max_amount
@@ -590,11 +745,31 @@ def _resolve_split_memo(
     return _prompt_split_memo_confirmation(suggested_split_memo, category_name)
 
 
+def _mark_match_used(
+    matching_order: Order,
+    used_order_ids: set[str] | None,
+    used_charge_keys: set[tuple[str, str, str]] | None,
+) -> None:
+    """Record a match as consumed so a later transaction cannot reuse it.
+
+    A charge-based match consumes only that charge row: a multi-shipment order
+    produces several charges and therefore several transactions, so retiring
+    the whole order would strand the rest of them.
+    """
+    charge = matching_order.matched_charge
+    if charge is not None:
+        if used_charge_keys is not None:
+            used_charge_keys.add(charge.key)
+        return
+    if used_order_ids is not None and matching_order.order_id is not None:
+        used_order_ids.add(matching_order.order_id)
+
+
 def process_transaction(
     transaction: Mapping[str, Any],
     index: int,
     total: int,
-    parsed_orders: list[Order] | None,
+    amazon_data: AmazonData | None,
     memo_generator: MemoGenerator,
     ynab_client: YNABClient,
     category_completer: CategoryCompleter,
@@ -603,6 +778,7 @@ def process_transaction(
     used_order_ids: set[str] | None = None,
     dry_run: bool = False,
     stats: dict[str, int] | None = None,
+    used_charge_keys: set[tuple[str, str, str]] | None = None,
 ) -> bool:
     """Process a single transaction through the interactive flow.
 
@@ -610,10 +786,13 @@ def process_transaction(
 
     ``used_order_ids`` accumulates the order IDs already applied to a
     transaction so the matcher does not reuse one order for several
-    same-amount transactions. When ``dry_run`` is True no changes are sent
-    to YNAB and matched orders are not marked as used. ``stats``, if given,
-    is used to accumulate run-level counters (currently just
-    ``auto_skipped_no_match``) for a summary printed at the end of the run.
+    same-amount transactions. ``used_charge_keys`` does the same for charge
+    rows from the payments page; it is tracked separately because one order
+    legitimately produces several charges, and so several transactions. When
+    ``dry_run`` is True no changes are sent to YNAB and matched orders are not
+    marked as used. ``stats``, if given, is used to accumulate run-level
+    counters (currently just ``auto_skipped_no_match``) for a summary printed
+    at the end of the run.
     """
     transaction_id = transaction["id"]
     date = transaction["date"]
@@ -623,10 +802,10 @@ def process_transaction(
     original_memo = transaction.get("memo", "")
 
     matching_order: Order | None = None
-    if parsed_orders:
+    if amazon_data:
         transaction_matcher = TransactionMatcher()
-        matching_order = transaction_matcher.find_matching_order(
-            amount_float, date, parsed_orders, used_order_ids
+        matching_order = transaction_matcher.resolve_order(
+            amount_float, date, amazon_data, used_order_ids, used_charge_keys
         )
 
     if amount_milliunits > 0:
@@ -660,15 +839,30 @@ def process_transaction(
         print(f"  Original Memo: {original_memo}")
 
     # Try to find matching order from parsed data and show it
-    if parsed_orders:
+    if amazon_data:
         if matching_order:
+            # A charge can name an order none of the pasted pages described.
+            # That is worth one more prompt: its details page is the
+            # difference between an order link and a real item list.
+            if (
+                not matching_order.items
+                and matching_order.matched_charge is not None
+                and matching_order.order_id
+            ):
+                filled = prompt_for_order_details(
+                    amazon_data, matching_order.order_id, memo_generator
+                )
+                if filled is not None:
+                    matching_order = dataclasses.replace(
+                        filled, matched_charge=matching_order.matched_charge
+                    )
             display_matched_order(matching_order, memo_generator)
         else:
-            # Order data was provided for this run, but nothing matched this
+            # Amazon data was provided for this run, but nothing matched this
             # specific transaction (by amount/date). There's no data to help
             # categorize it, so skip the prompt instead of asking blind.
-            # (When parsed_orders itself is empty/None — i.e. no order data
-            # was provided at all this run — we fall through to the normal
+            # (When amazon_data itself is empty/None — i.e. nothing was
+            # provided at all this run — we fall through to the normal
             # action loop below, which still offers manual item entry.)
             print(
                 "  ⚠ No matching order found in parsed Amazon data — "
@@ -705,16 +899,11 @@ def process_transaction(
                 dry_run,
             )
             if result == "done":
-                # Mark the matched order as consumed so it is not reused for a
-                # later transaction of the same amount. Skip in dry-run because
+                # Mark what was consumed so it is not reused for a later
+                # transaction of the same amount. Skip in dry-run because
                 # nothing was actually applied.
-                if (
-                    not dry_run
-                    and used_order_ids is not None
-                    and matching_order is not None
-                    and matching_order.order_id is not None
-                ):
-                    used_order_ids.add(matching_order.order_id)
+                if not dry_run and matching_order is not None:
+                    _mark_match_used(matching_order, used_order_ids, used_charge_keys)
                 return True
             # result == "continue" means back to action prompt
             continue
@@ -941,39 +1130,30 @@ def _run(argv: list[str] | None = None) -> int:
     category_completer_instance = CategoryCompleter(categories_list)
     print(f"\nFound {len(categories_list)} usable categories. Completion enabled.")
 
-    # Ask user if they want to provide Amazon orders data for automatic item detection
-    print("\n--- Optional: Amazon Orders Data ---")
+    # Ask user if they want to provide Amazon page data for automatic item detection
+    print("\n--- Optional: Amazon Data ---")
     print(
-        "You can paste Amazon orders page content to automatically match transactions with order details."
+        "You can paste your Amazon orders, order details, and transactions pages\n"
+        "to match YNAB transactions to orders and their items."
     )
     provide_orders = _prompt_line(
-        "Would you like to provide Amazon orders data? (y/n, default y): "
+        "Would you like to provide Amazon data? (y/n, default y): "
     ).lower()
     if not provide_orders:
         provide_orders = "y"
 
-    parsed_orders = None
+    amazon_data: AmazonData | None = None
     if provide_orders == "y":
-        parsed_orders = prompt_for_amazon_orders_data()
-        if parsed_orders:
-            print(f"✓ Parsed {len(parsed_orders)} orders from Amazon data")
-            for order in parsed_orders[:3]:
-                print(
-                    f"  - Order {order.order_id}: "
-                    f"{format_currency_amount(order.total, order.currency)} "
-                    f"({len(order.items)} items)"
-                )
-            if len(parsed_orders) > 3:
-                print(f"  ... and {len(parsed_orders) - 3} more orders")
-        else:
-            print("No valid orders found in provided data.")
+        amazon_data = prompt_for_amazon_data()
+        if not amazon_data:
+            print("No usable Amazon data found in provided text.")
 
     # --- Batch Mode (non-interactive memo enrichment) ---
     if args.batch:
         print("\n--- Batch: auto-enriching memos for confident matches ---")
         enriched, skipped, failed = process_batch(
             transactions_to_process,
-            parsed_orders,
+            amazon_data,
             memo_generator,
             ynab_client,
             dry_run,
@@ -986,13 +1166,14 @@ def _run(argv: list[str] | None = None) -> int:
 
     # --- Process Transactions (Main Loop) ---
     used_order_ids: set[str] = set()
+    used_charge_keys: set[tuple[str, str, str]] = set()
     stats: dict[str, int] = {}
     for i, t in enumerate(transactions_to_process):
         should_continue = process_transaction(
             t,
             i,
             len(transactions_to_process),
-            parsed_orders,
+            amazon_data,
             memo_generator,
             ynab_client,
             category_completer_instance,
@@ -1001,6 +1182,7 @@ def _run(argv: list[str] | None = None) -> int:
             used_order_ids,
             dry_run,
             stats,
+            used_charge_keys,
         )
         if not should_continue:
             return 0

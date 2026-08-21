@@ -3,8 +3,9 @@
 import logging
 import re
 from datetime import datetime
+from typing import Literal
 
-from .models import Order
+from .models import AmazonCharge, Order, OrderItem, expand_items
 
 logger = logging.getLogger(__name__)
 
@@ -50,10 +51,119 @@ ORDER_TAIL_SENTINEL_PATTERN = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 
+AMOUNT_PATTERN = r"[0-9][0-9,]*(?:\.[0-9]{1,2})?"
+
+# --- Payments/transactions page ---------------------------------------------
+# Rows look like "Prime Visa ****1234-$42.68" / "Amazon Gift Card-$15.61" /
+# "Prime Visa ****1234+$19.36": the payment method and the signed amount are
+# copied as one line with no separator, followed by "Order #..." (or
+# "Refund: Order #...") and then the merchant descriptor.
+CHARGE_AMOUNT_PATTERN = re.compile(
+    rf"^\s*(?P<method>.*?)\s*(?P<sign>[-+])\s*"
+    rf"(?P<currency>{CURRENCY_PREFIX_PATTERN})\s*(?P<amount>{AMOUNT_PATTERN})\s*$"
+)
+CHARGE_ORDER_PATTERN = re.compile(
+    rf"^\s*(?P<refund>Refund:)?\s*Order\s*#\s*(?P<order_id>{ORDER_ID_PATTERN})\s*$",
+    re.IGNORECASE,
+)
+DATE_HEADING_PATTERN = re.compile(rf"^\s*(?P<date>{ORDER_DATE_PATTERN})\s*$")
+# Lines between the "Order #" row and the next charge that are page furniture
+# rather than the merchant descriptor.
+CHARGE_STATUS_PATTERN = re.compile(
+    r"^\s*(?:Completed|In Progress|Pending|Processing|Transactions|"
+    r"Refunded|Cancell?ed)\s*$",
+    re.IGNORECASE,
+)
+# How many lines after the amount to keep looking for its "Order #" row before
+# giving up, so an extra blank/decoration line does not drop a real charge.
+MAX_LINES_AMOUNT_TO_ORDER = 3
+
+# --- Order details page ------------------------------------------------------
+ORDER_DETAILS_HEADER_PATTERN = re.compile(
+    rf"{ORDER_START_LABEL}\s*:?\s*(?P<date>{ORDER_DATE_PATTERN})"
+    rf".{{0,200}}?Order\s*#\s*(?P<order_id>{ORDER_ID_PATTERN})",
+    re.DOTALL | re.IGNORECASE,
+)
+ORDER_DETAILS_URL_PATTERN = re.compile(
+    rf"order-details\?[^\s]*orderID=(?P<order_id>{ORDER_ID_PATTERN})",
+    re.IGNORECASE,
+)
+SOLD_BY_PATTERN = re.compile(r"^\s*Sold by:", re.IGNORECASE)
+PRICE_LINE_PATTERN = re.compile(
+    rf"^\s*(?P<currency>{CURRENCY_PREFIX_PATTERN})\s*(?P<amount>{AMOUNT_PATTERN})\s*$"
+)
+
+# Order-summary rows. Each label may be followed by its amount on the same line
+# or on the next one, depending on how the page was copied.
+SUMMARY_LABELS: dict[str, tuple[str, ...]] = {
+    "subtotal": (r"Item\(s\) Subtotal", r"Items? Subtotal", r"Subtotal"),
+    "tax": (
+        r"Estimated tax to be collected",
+        r"Estimated tax",
+        r"Tax Collected",
+        r"Tax",
+    ),
+    "total": (r"Grand Total", r"Order Total", r"Total for this Order"),
+}
+
 # Sanity cap for a detected quantity badge (see _deduplicate_and_badge_filter).
 # Above this, a trailing number is more likely a coincidental part of the
 # title (e.g. a model number) than a genuine "you bought N of these" badge.
 MAX_REASONABLE_BADGE_QTY = 12
+
+# How many charge rows a page needs before it is called a transactions page on
+# structure alone (i.e. without its URL). One coincidental amount/order pair is
+# not enough; a real payments page always lists many.
+MIN_CHARGE_ROWS_FOR_DETECTION = 2
+
+PageKind = Literal["orders", "details", "transactions", "unknown"]
+
+
+def detect_page_kind(text: str) -> PageKind:
+    """Identify which Amazon page a pasted blob came from.
+
+    Lets the tool accept the orders list, an order details page, and the
+    payments/transactions page through one prompt instead of asking the user
+    to declare which is which. Checks run most-distinctive first: the
+    transactions page has no order headers at all, and a details page has no
+    "Total" beside its order header, so the three are mutually exclusive in
+    practice.
+    """
+    if not text.strip():
+        return "unknown"
+
+    normalized = _normalize_markdown_text(text)
+
+    if "/yourpayments/transactions" in normalized.lower():
+        return "transactions"
+
+    if ORDER_DETAILS_URL_PATTERN.search(normalized):
+        return "details"
+
+    if ORDER_HEADER_PATTERN.search(normalized):
+        return "orders"
+
+    charge_rows = 0
+    lines = normalized.split("\n")
+    for index, line in enumerate(lines):
+        if not CHARGE_AMOUNT_PATTERN.match(line):
+            continue
+        if any(
+            CHARGE_ORDER_PATTERN.match(following)
+            for following in lines[index + 1 : index + 1 + MAX_LINES_AMOUNT_TO_ORDER]
+        ):
+            charge_rows += 1
+    if charge_rows >= MIN_CHARGE_ROWS_FOR_DETECTION:
+        return "transactions"
+
+    if ORDER_DETAILS_HEADER_PATTERN.search(normalized) and (
+        SOLD_BY_PATTERN.search(normalized)
+        or re.search(r"^\s*Order Summary\s*$", normalized, re.IGNORECASE | re.MULTILINE)
+        or re.search(r"^\s*Grand Total", normalized, re.IGNORECASE | re.MULTILINE)
+    ):
+        return "details"
+
+    return "unknown"
 
 
 def _normalize_markdown_text(text: str) -> str:
@@ -454,3 +564,304 @@ class AmazonParser:
                 candidates.append((cleaned, had_leading_space))
 
         return self._deduplicate_and_badge_filter(candidates)
+
+    # --- Payments/transactions page ------------------------------------
+
+    def parse_transactions_page(self, transactions_text: str) -> list[AmazonCharge]:
+        """Parse Amazon's payments/transactions page into individual charges.
+
+        This is the page that tells us which *card charge* belongs to which
+        order. The orders page only reports order totals, so a transaction can
+        go unmatched whenever the charge and the order total differ — a
+        multi-shipment order billed per package, an order partly paid with a
+        gift card or reward points, or a refund. Each row here carries the
+        order ID outright, which removes the guesswork.
+
+        Rows without an order ID (e.g. gift card reloads) are ignored: without
+        an order there is nothing to enrich a YNAB transaction with.
+        """
+        if not transactions_text.strip():
+            return []
+
+        lines = _normalize_markdown_text(transactions_text).split("\n")
+        charges: list[AmazonCharge] = []
+        seen: set[tuple[str, str, str]] = set()
+        current_date: str | None = None
+
+        index = 0
+        while index < len(lines):
+            line = lines[index]
+
+            date_heading = DATE_HEADING_PATTERN.match(line)
+            if date_heading:
+                current_date = self._normalize_order_date(
+                    date_heading.group("date").strip()
+                )
+                index += 1
+                continue
+
+            amount_match = CHARGE_AMOUNT_PATTERN.match(line)
+            if not amount_match:
+                index += 1
+                continue
+
+            order_line_index = self._find_charge_order_line(lines, index + 1)
+            if order_line_index is None:
+                index += 1
+                continue
+
+            order_match = CHARGE_ORDER_PATTERN.match(lines[order_line_index])
+            assert order_match is not None  # guaranteed by _find_charge_order_line
+
+            amount = float(amount_match.group("amount").replace(",", ""))
+            if amount_match.group("sign") == "-":
+                amount = -amount
+            method = amount_match.group("method").strip() or None
+            is_refund = bool(order_match.group("refund")) or amount > 0
+
+            charge = AmazonCharge(
+                amount=amount,
+                date_str=current_date,
+                order_id=order_match.group("order_id"),
+                payment_method=method,
+                merchant=self._charge_merchant(lines, order_line_index + 1),
+                is_refund=is_refund,
+                currency=amount_match.group("currency"),
+            )
+            if charge.key not in seen:
+                seen.add(charge.key)
+                charges.append(charge)
+
+            index = order_line_index + 1
+
+        if not charges:
+            logger.info("No charges could be parsed from the transactions page text.")
+        return charges
+
+    def _find_charge_order_line(self, lines: list[str], start: int) -> int | None:
+        """Index of the "Order #" row belonging to the charge amount before it."""
+        checked = 0
+        for index in range(start, len(lines)):
+            if not lines[index].strip():
+                continue
+            if CHARGE_ORDER_PATTERN.match(lines[index]):
+                return index
+            checked += 1
+            if checked >= MAX_LINES_AMOUNT_TO_ORDER:
+                return None
+        return None
+
+    def _charge_merchant(self, lines: list[str], start: int) -> str | None:
+        """Merchant descriptor following a charge's "Order #" row, when present."""
+        for index in range(start, min(start + 3, len(lines))):
+            candidate = lines[index].strip()
+            if not candidate:
+                continue
+            if (
+                CHARGE_AMOUNT_PATTERN.match(candidate)
+                or CHARGE_ORDER_PATTERN.match(candidate)
+                or DATE_HEADING_PATTERN.match(candidate)
+                or CHARGE_STATUS_PATTERN.match(candidate)
+            ):
+                return None
+            return candidate
+        return None
+
+    # --- Order details page ---------------------------------------------
+
+    def parse_order_details_page(self, details_text: str) -> list[Order]:
+        """Parse one or more Amazon order *details* pages.
+
+        The orders list page paginates items inside each order card, so a large
+        order shows only some of its items and never shows per-item prices. The
+        details page has the full list with prices plus the order summary
+        (subtotal/tax/grand total), which is what makes an informed split
+        possible. Several pages may be pasted together; each is parsed
+        separately.
+        """
+        if not details_text.strip():
+            return []
+
+        text = _normalize_markdown_text(details_text)
+        if not self._looks_like_order_details(text):
+            return []
+
+        orders: list[Order] = []
+        headers = list(ORDER_DETAILS_HEADER_PATTERN.finditer(text))
+        if not headers:
+            order = self._parse_single_order_details(text, None)
+            return [order] if order else []
+
+        for position, header in enumerate(headers):
+            start = header.start()
+            end = (
+                headers[position + 1].start()
+                if position + 1 < len(headers)
+                else len(text)
+            )
+            # The URL line sits above the header, so search the whole page for
+            # it when this is the only order on it.
+            url_scope = text if len(headers) == 1 else text[start:end]
+            order = self._parse_single_order_details(text[start:end], header, url_scope)
+            if order:
+                orders.append(order)
+
+        return orders
+
+    def _looks_like_order_details(self, text: str) -> bool:
+        """Guard against handing an orders-list or unrelated page to this parser."""
+        return bool(
+            ORDER_DETAILS_URL_PATTERN.search(text)
+            or SOLD_BY_PATTERN.search(text)
+            or re.search(r"^\s*Order Summary\s*$", text, re.IGNORECASE | re.MULTILINE)
+            or re.search(r"^\s*Grand Total", text, re.IGNORECASE | re.MULTILINE)
+        )
+
+    def _parse_single_order_details(
+        self,
+        section: str,
+        header: re.Match[str] | None,
+        url_scope: str | None = None,
+    ) -> Order | None:
+        """Build one Order from a single order-details page section."""
+        order_id: str | None = None
+        date_str: str | None = None
+        if header:
+            order_id = header.group("order_id")
+            date_str = self._normalize_order_date(header.group("date").strip())
+        if not order_id:
+            url_match = ORDER_DETAILS_URL_PATTERN.search(url_scope or section)
+            if url_match:
+                order_id = url_match.group("order_id")
+        if not order_id:
+            logger.info("Skipping an order-details section with no order ID.")
+            return None
+
+        subtotal, _ = self._find_summary_amount(section, SUMMARY_LABELS["subtotal"])
+        tax, _ = self._find_summary_amount(section, SUMMARY_LABELS["tax"])
+        total, currency = self._find_summary_amount(section, SUMMARY_LABELS["total"])
+
+        detailed_items = self._extract_detailed_items(section)
+        items, item_prices = expand_items(detailed_items, MAX_ITEMS_PER_ORDER)
+
+        if not items:
+            # No "Sold by:" anchors (e.g. a digital or grocery order): fall back
+            # to name-only extraction so the order is still useful for memos.
+            items = self.extract_items_from_content(section)
+            detailed_items = [OrderItem(name=name) for name in items]
+            item_prices = [None] * len(items)
+
+        return Order(
+            order_id=order_id,
+            total=total,
+            date_str=date_str,
+            items=items,
+            currency=currency,
+            detailed_items=detailed_items,
+            subtotal=subtotal,
+            tax=tax,
+            item_prices=item_prices,
+        )
+
+    def _find_summary_amount(
+        self, section: str, labels: tuple[str, ...]
+    ) -> tuple[float | None, str | None]:
+        """First matching order-summary amount, trying labels most-specific first.
+
+        The amount may sit on the label's line or on the next one depending on
+        how the page was copied, so both layouts are accepted.
+        """
+        for label in labels:
+            match = re.search(
+                rf"^[ \t]*{label}[ \t]*:?[ \t]*(?:\r?\n)?[ \t]*"
+                rf"(?P<sign>-)?(?P<currency>{CURRENCY_PREFIX_PATTERN})[ \t]*"
+                rf"(?P<amount>{AMOUNT_PATTERN})[ \t]*$",
+                section,
+                re.IGNORECASE | re.MULTILINE,
+            )
+            if match:
+                amount = float(match.group("amount").replace(",", ""))
+                if match.group("sign"):
+                    amount = -amount
+                return amount, match.group("currency")
+        return None, None
+
+    def _extract_detailed_items(self, section: str) -> list[OrderItem]:
+        """Extract items with per-unit prices, anchored on each "Sold by:" row.
+
+        Every purchased line on a details page is followed by "Sold by: <seller>"
+        and then its price, which is a far more reliable anchor than the
+        heuristics needed for the orders list page — and it also excludes the
+        cart preview and recommendation carousels that surround the real order.
+        """
+        lines = self._trim_footer(section).split("\n")
+        anchors = [
+            index for index, line in enumerate(lines) if SOLD_BY_PATTERN.match(line)
+        ]
+        if not anchors:
+            return []
+
+        items: list[OrderItem] = []
+        # Skip the address/payment/summary block above the first shipment so its
+        # mixed-case lines (recipient name, card blurb) cannot pass for a title.
+        title_start = self._items_region_start(lines)
+        for position, anchor in enumerate(anchors):
+            name, quantity = self._details_title(lines[title_start:anchor])
+            next_anchor = (
+                anchors[position + 1] if position + 1 < len(anchors) else len(lines)
+            )
+            price = self._first_price(lines, anchor + 1, next_anchor)
+            if name:
+                items.append(OrderItem(name=name, price=price, quantity=quantity))
+            title_start = anchor + 1
+        return items
+
+    def _items_region_start(self, lines: list[str]) -> int:
+        """Index just past the order-summary block, or 0 when it is absent."""
+        for index in range(len(lines) - 1, -1, -1):
+            if re.match(
+                r"^\s*(?:Grand Total|Order Total|Total for this Order)\b",
+                lines[index],
+                re.IGNORECASE,
+            ):
+                # Skip the label and, when present, the amount on the next line.
+                nxt = index + 1
+                if nxt < len(lines) and PRICE_LINE_PATTERN.match(lines[nxt]):
+                    return nxt + 1
+                return nxt
+        return 0
+
+    def _details_title(self, region: list[str]) -> tuple[str, int]:
+        """Title and quantity for the item whose "Sold by:" row follows ``region``.
+
+        Amazon repeats each title twice — the image's alt text, then the product
+        link — and stamps the quantity onto the alt-text copy ("...Black3"). The
+        link copy is the clean one, so the *last* candidate wins, and an earlier
+        candidate that is the same text plus trailing digits supplies the
+        quantity.
+        """
+        candidates = [
+            cleaned
+            for cleaned in (self._get_valid_cleaned_item(line) for line in region)
+            if cleaned
+        ]
+        if not candidates:
+            return "", 1
+
+        name = candidates[-1]
+        quantity = 1
+        for candidate in candidates[:-1]:
+            badge = re.match(rf"^{re.escape(name)}\s*(\d+)$", candidate)
+            if badge:
+                parsed = int(badge.group(1))
+                if 1 <= parsed <= MAX_REASONABLE_BADGE_QTY:
+                    quantity = parsed
+        return name, quantity
+
+    def _first_price(self, lines: list[str], start: int, end: int) -> float | None:
+        """First standalone price line in ``lines[start:end]``."""
+        for index in range(start, min(end, len(lines))):
+            price_match = PRICE_LINE_PATTERN.match(lines[index])
+            if price_match:
+                return float(price_match.group("amount").replace(",", ""))
+        return None

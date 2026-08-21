@@ -4,9 +4,11 @@ A Python package that assists in categorizing Amazon transactions in YNAB (You N
 
 ## Features
 
-When you paste in the text from your Amazon order page:
+When you paste in the text from your Amazon pages:
 
 🎯 **Smart Order Matching**: Automatically matches YNAB transactions with Amazon orders by amount and date  
+🧾 **Charge-Level Matching**: Reads your Amazon payments page so transactions that *don't* equal an order total still match — multi-shipment orders, gift-card/points split payments, and refunds  
+🏷️ **Per-Item Prices**: Reads an order details page for the full item list with prices and tax, so splits use real numbers  
 📝 **Enhanced Memos**: Generates detailed memos with item names and direct Amazon order links  
 🔄 **Intelligent Splitting**: Suggests splitting transactions with multiple items into separate categories  
 ⚡ **Streamlined Workflow**: Smart defaults and tab completion for fast categorization  
@@ -144,29 +146,45 @@ ynab-amazon-categorizer --batch --dry-run
 ynab-amazon-categorizer --batch
 ```
 
-You still paste the Amazon orders page once when prompted; `--batch` only
-removes the per-transaction prompting.
+You still paste the Amazon pages once when prompted; `--batch` only removes
+the per-transaction prompting. Charge-matched transactions are enriched too,
+including both transactions of a two-shipment order.
 
 ### Workflow
-1. **Provide Amazon Orders Data** (optional but recommended):
-   - Copy your Amazon orders page content
-     - For example go to https://www.amazon.ca/gp/css/order-history?ref_=nav_orders_first and select all and copy the text
-   - Run the tool and paste Amazon order info when prompted 
-   - The script will automatically match transactions with orders
+1. **Provide Amazon Data** (optional but recommended):
+   - Run the tool and paste one or more Amazon pages when prompted. The page
+     type is detected automatically, so you can paste them in any order, and
+     paste as many as you like before continuing.
+   - The script will automatically match transactions with orders.
+
+   | Page | URL | What it adds |
+   | --- | --- | --- |
+   | Your Orders | `/gp/css/order-history` | Order totals and item names |
+   | Order details | open an order → *View order details* | Every item with its price, plus the order's tax |
+   | Your Transactions | `/cpe/yourpayments/transactions` | Which card charge paid for which order |
+
+   Select all and copy the whole page each time.
 
 2. **Review Matched Transactions**:
    - The script shows order details, items, and links before asking to categorize
    - For multiple items, it suggests splitting the transaction
+   - When a charge covers only part of an order, it says so — the items listed
+     are the whole order's, because Amazon doesn't state which items shipped
+     under which charge
+   - If a charge names an order you haven't pasted a page for, the tool offers
+     to take that order's details page right then
 
 3. **Categorize Transactions**:
    - Use tab completion to select categories
    - Accept suggested memos or customize them
+   - While splitting, press `i` to use the item's price from the order details
+     page as the base amount
    - Confirm updates with enhanced previews
 
 ### Keyboard Shortcuts
 - **Tab**: Auto-complete category names
 - **Enter**: Accept defaults (categorize, use suggested memo, confirm update)
-- **Alt+Enter**: Submit multiline input (Amazon orders data, custom memos)
+- **Alt+Enter**: Submit multiline input (Amazon page data, custom memos)
 - **Ctrl+C**: Cancel current operation
 
 ## Example Output
@@ -184,6 +202,24 @@ removes the per-transaction prompting.
 Action? (c = categorize/split, s = skip, q = quit, default c): 
 There is more than one item in this transaction.
 Split this transaction? (y/n, default n): y
+```
+
+With the transactions and order details pages pasted, a charge that is only
+part of an order matches too, and items carry their prices:
+
+```
+🎯 MATCHED ORDER FOUND:
+   Order ID: 114-1234567-1234567
+   Total: $157.90
+   Date: August 13, 2026
+   Charge: -$115.22 on August 15, 2026 via Prime Visa ****1234
+   ⚠ This charge covers PART of the order — the items below are the whole order.
+   Order Link: https://www.amazon.com/gp/your-account/order-details?ie=UTF8&orderID=114-1234567-1234567
+   Order tax: $11.52
+   Items:
+     - Caribou Coffee Caribou Blend, Keurig K-Cup Pods, 32 Count — $19.99
+     - Large Ceramic Coffee Mug Set of 4, 16 oz Tea Cups with Handle — $19.99
+     - Amazon Basics Square Sticky Notes, 3x3 Inches, 12-Pack — $7.19
 ```
 
 ## Generated Memos
@@ -205,6 +241,10 @@ Fancy Feast Grilled Wet Cat Food, Tuna Feast - 85 g Can (24 Pack)
 
 ⚠️ **Important**: Never commit your `.env` file to version control!
 
+⚠️ Saved copies of Amazon pages contain your name, shipping address, card
+last-4 digits, and real order IDs. Keep them out of version control —
+`.gitignore` excludes the obvious filenames, but check before committing.
+
 - The script loads credentials from environment variables or config file
 - Your API key is never hardcoded in the script
 - Add `.env` to your `.gitignore` if using git
@@ -214,6 +254,19 @@ Fancy Feast Grilled Wet Cat Food, Tuna Feast - 85 g Can (24 Pack)
 ### "No orders could be parsed"
 - Make sure you're copying the full Amazon orders page content
 - Try copying from a different browser or clearing browser cache
+
+### "No matching order found" for transactions that clearly are Amazon orders
+YNAB records what hit your card; the orders page shows what the *order* cost.
+Those differ when an order ships in several packages (billed once per package),
+when part of it is paid with a gift card or reward points, or when it's a
+refund. Paste the **Your Transactions** page
+(`https://www.amazon.com/cpe/yourpayments/transactions`) — it states the order
+ID for every individual charge, which resolves all of those cases.
+
+### Matched order shows fewer items than the order really had
+The orders list page paginates items inside each order card, so a large order
+shows only some of them. Paste that order's **details** page for the full list
+with per-item prices.
 
 ### "API Key not found"
 - Verify your `.env` file exists and has the correct format
