@@ -153,24 +153,28 @@ def _print_coverage(summary: CoverageSummary, domain: str) -> None:
 
 
 def _confirm_more_pages(summary: CoverageSummary, domain: str) -> bool:
-    """Ask whether to keep pasting once every transaction is already covered.
+    """Whether to keep pasting once every transaction is already covered.
 
-    Without this the loop kept presenting a paste box after there was nothing
-    left to collect. Answering is one keystroke, and the default ends the loop,
-    so the common case is just Enter.
+    Only asks when another page could still change something. With nothing
+    left to gain there is no question worth putting to the user, so the loop
+    just ends.
     """
     print("  ✓ Every transaction has an order and its items.")
-    if summary.without_prices:
-        # Complete coverage is not the same as complete *pricing*: an order
-        # matched from the orders list page has item names but no prices.
-        print(
-            f"  {summary.without_prices} transaction(s) have item names but no "
-            "prices. Optional:\n    paste these order details pages to make "
-            "splits exact."
-        )
-        _print_order_links(summary.orders_needing_prices, domain, "        ")
-    else:
+
+    if not summary.without_prices:
         print("  Nothing further is needed.")
+        return False
+
+    # Complete coverage is not the same as complete *pricing*: an order matched
+    # from the orders list page has item names but no prices. Pasting those
+    # pages now is optional — a split will offer to fetch one on demand — so
+    # this is a real choice rather than a formality.
+    print(
+        f"  {summary.without_prices} transaction(s) have item names but no "
+        "prices. Optional:\n    paste these order details pages to make "
+        "splits exact."
+    )
+    _print_order_links(summary.orders_needing_prices, domain, "        ")
 
     answer = _prompt_line("Paste more pages anyway? (y/n, default n): ")
     return answer.strip().lower() == "y"

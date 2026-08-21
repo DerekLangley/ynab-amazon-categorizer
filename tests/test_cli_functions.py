@@ -1985,7 +1985,7 @@ def test_prompt_for_amazon_data_stays_quiet_without_transactions(
 def test_prompt_for_amazon_data_stops_asking_once_covered(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Full coverage must end the loop instead of presenting another paste box."""
+    """With nothing left to gain, end the loop without asking anything."""
     orders_page = """
 ORDER PLACED
 August 13, 2026
@@ -2009,8 +2009,10 @@ ORDER # 114-8901234-8901234
         [_charge_txn("t1", -115220)], MemoGenerator("amazon.com")
     )
 
-    assert any("Paste more pages anyway?" in message for message in asked)
-    assert "Paste page 2" not in capsys.readouterr().out
+    captured = capsys.readouterr().out
+    assert "Nothing further is needed." in captured
+    assert asked == [], "no question is worth asking when nothing can change"
+    assert "Paste page 2" not in captured
 
 
 def test_prompt_for_amazon_data_keeps_going_when_asked(
@@ -2024,6 +2026,7 @@ TOTAL
 $115.22
 ORDER # 114-8901234-8901234
  Amazon Basics Low-Odor Dry Erase Whiteboard Markers, 4-Pack
+ BIC Brite Liner Highlighters, Chisel Tip, 12-Count Pack, Assorted Colors
 """
     pages = [orders_page, ""]
     monkeypatch.setattr(

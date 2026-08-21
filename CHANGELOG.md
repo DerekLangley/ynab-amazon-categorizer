@@ -33,7 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   list of the exact orders whose details pages are still worth fetching — plus
   a hint at which page will close the remaining gap
 - The paste loop ends once every transaction is covered instead of asking for
-  another page
+  another page, and asks nothing at all when no further page could change
+  anything
 - Missing item prices are only raised for multi-item orders, and only when the
   user chooses to split — a single-item order cannot be split, so its price
   changes nothing, and a details page is offered at the split itself rather
